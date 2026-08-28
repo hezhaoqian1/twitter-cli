@@ -1,0 +1,3 @@
+"""Alembic migration template."""
+
+${message}
