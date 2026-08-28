@@ -9,6 +9,12 @@ from .accounts import (
     AccountListItem,
     AccountListResponse,
 )
+from .balances import (
+    BalanceListResponse,
+    BalanceResponse,
+    BalanceSyncRequest,
+    BalanceSyncResponse,
+)
 from .bindings import (
     BindingConfirmRequest,
     BindingCreateRequest,
@@ -50,6 +56,10 @@ __all__ = [
     "AccountImportSummary",
     "AccountListItem",
     "AccountListResponse",
+    "BalanceListResponse",
+    "BalanceResponse",
+    "BalanceSyncRequest",
+    "BalanceSyncResponse",
     "BindingConfirmRequest",
     "BindingCreateRequest",
     "BindingListResponse",

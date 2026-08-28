@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, text
 
 from .api.routers.accounts import router as accounts_router
 from .api.routers.bindings import router as bindings_router
+from .api.routers.balances import router as balances_router
 from .api.routers.imports import router as imports_router
 from .api.routers.vault import router as vault_router
 from .api.routers.wallets import router as wallets_router
@@ -68,6 +69,7 @@ def create_app(
     app.include_router(imports_router)
     app.include_router(accounts_router)
     app.include_router(bindings_router)
+    app.include_router(balances_router)
     app.include_router(vault_router)
     app.include_router(wallets_router)
     app.include_router(tasks_router)

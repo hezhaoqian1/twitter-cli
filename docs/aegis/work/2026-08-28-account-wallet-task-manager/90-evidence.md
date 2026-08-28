@@ -197,14 +197,47 @@ Date: `2026-08-28`
 
 ## Current Verification Baseline
 
-- Fresh complete non-smoke suite: `318 passed, 6 deselected, 1 warning in
-  11.58s`.
-- Fresh adapter suite: `14 passed in 0.46s`.
-- Fresh static checks: Ruff, Mypy, compileall, and `git diff --check` passed.
-- Fresh frontend production build: Vite completed successfully in `1.54s`.
-- Aegis workspace `check` and `bundle` commands completed with exit status 0;
-  these validate workspace structure and packaging, not external evidence
-  sufficiency.
+- Fresh complete non-smoke suite: `336 passed, 6 deselected, 1 warning`.
+- Fresh focused batch/backup suite: `5 passed in 4.82s`.
+- Fresh production-code type check: `mypy manager_api` passed for 54 source
+  files.
+- Fresh Ruff check: `All checks passed!`.
+- Fresh Python compile check and `git diff --check` passed.
+- Fresh frontend checks: `tsc -b` passed and Vite transformed 1578 modules
+  into a successful production build.
+- Full `mypy manager_api tests/manager` remains red only on fixture-level
+  annotations in ten test files; it does not report production code errors.
+
+## Batch 5, Task 11: Ordered Pair Workflow Evidence
+
+- Added a durable `account_wallet` workflow batch that creates one independent
+  `verify_account -> bind -> repost` chain per selected pair.
+- Added a self-referential predecessor field to `task_jobs`; the scheduler only
+  dispatches a dependent job after its predecessor reaches `succeeded`.
+- Each child job retains the account and wallet lease keys for its own pair, so
+  a failed or delayed pair does not prevent unrelated pairs from advancing.
+- Added `POST /api/tasks/workflows` and a management-console dialog for explicit
+  account/address pairing, repost target, and default dispatch limit 10.
+- Synthetic workflow suite: `6 passed`; manager suite after the change:
+  `68 passed, 1 warning`.
+- Fresh SQLite migration smoke reached Alembic `head` through
+  `0002_task_workflows`.
+- No provider credentials, cookies, private keys, mnemonics, or remote
+  database connection strings were used in this evidence.
+
+## Batch 5, Task 12: Backup and Batch Lifecycle Evidence
+
+- Encrypted backup/restore tests cover round trips, checksum tampering,
+  manifest tampering, wrong recovery keys, malformed packages, and non-empty
+  restore targets.
+- Backup HTTP routes return only a sanitized summary; the downloadable
+  package is encrypted and the UI reports format, table, row, key, and
+  checksum status without displaying secrets.
+- Batch pause, resume, and cancel transitions are durable, and the scheduler
+  skips non-active batches.
+- Pending external polling observes cancellation and releases the pair lease
+  through the worker path.
+- Fresh focused batch/backup suite: `5 passed`.
 
 ## Closed-Slice Boundary
 
@@ -213,8 +246,79 @@ Date: `2026-08-28`
 - Provider credentials, cookies, wallet keys, recovery material, and hosted
   database/Redis connection values remain excluded from source, fixtures,
   logs, and evidence.
-- Live PostgreSQL/Redis startup and migration smoke remain outstanding because
-  the local Docker daemon is unavailable; readiness currently reports
-  PostgreSQL `down` and Redis `ok`.
-- Encrypted backup/restore and Railway deployment verification are the next
-  implementation slices.
+- Live PostgreSQL/Redis startup and migration smoke are verified through the
+  local Clash tunnel; direct TCP access remains unavailable from this host.
+- Encrypted backup/restore and batch lifecycle controls are implemented and
+  verified. Railway runtime verification is complete through the local Clash
+  tunnel; hosted deployment and live provider end-to-end actions remain open.
+
+## Batch 4, Task 11: Kredo Balance Evidence
+
+- The Kredo account summary contract was recorded from the frontend bundle:
+  `points`, `cashHsk.available`, and `portfolio.positionsValueHsk`.
+- Added `KredoBalanceSnapshot`, one replaceable row per binding, with numeric
+  precision, sync status, last successful timestamp, and safe error code.
+- Added `balance_sync` task creation, isolated account/wallet lease scope, and
+  worker execution through `KredoAdapter.account_summary`.
+- Sync failures preserve the last successful numeric values and only update
+  the redacted status/error fields.
+- Added `GET /api/balances`, `GET /api/balances/{binding_id}`, and
+  `POST /api/balances/sync`; binding responses also include the latest balance.
+- The binding UI now shows Points, available HSK, position HSK, and sync time,
+  with row-level and selected-batch sync actions.
+- Focused adapter and balance suite: `20 passed`.
+- Raw provider responses, account credentials, cookies, wallet keys, and
+  remote connection strings remain excluded from source, tests, logs, and
+  evidence.
+
+## Railway Runtime Configuration Check
+
+- The local manager runtime now reads the supplied Railway PostgreSQL and
+  Redis values from the Git-ignored `.env.manager` file.
+- The requested connection details are recorded in the Git-ignored
+  `docs/local-railway-runtime.md` file only; no concrete value was added to
+  tracked source, fixtures, logs, or committed evidence.
+- On 2026-08-28, DNS resolved both Railway proxy hosts, while direct TCP
+  connections to PostgreSQL `34945` and Redis `35427` timed out.
+- Local unit and integration tests continue to use isolated SQLite databases
+  and deterministic doubles; the private `.env.manager` path is reserved for
+  real dependency smoke checks and migrations.
+- Added `scripts/manager_clash_tunnel.py`, a generic local TCP forwarder that
+  uses Clash HTTP `CONNECT` without logging application payloads.
+- Through Clash `127.0.0.1:7890`, PostgreSQL and Redis probes passed and
+  `uv run python scripts/manager_clash_tunnel.py -- uv run python
+  scripts/manager_migrate.py` reached Alembic `head` on 2026-08-28.
+- The first live migration exposed PostgreSQL incompatibility in the
+  SQLite-oriented batch rebuilds. Revisions `0002`, `0003`, and `0004` now
+  use PostgreSQL-native ALTER operations and retain batch rebuilds only for
+  SQLite.
+
+## Batch 5, Task 13: Scheduler and Cancellation Hardening
+
+- Batch dispatch now accounts for active leases per `TaskBatch` and enforces
+  each batch's `dispatch_limit` before selecting another child job.
+- Queued dependents of failed, blocked, or cancelled predecessors transition
+  to `blocked` with the redacted failure code `dependency_failed`, so they do
+  not remain indefinitely eligible-looking in the queue.
+- A retryable predecessor recovery requeues blocked dependents when the
+  predecessor succeeds, preserving the ordered workflow chain.
+- Queued and paused cancellation is immediate; leased cancellation releases
+  resource leases; running cancellation records a request and the worker
+  commits `cancelled` after the handler returns.
+- Regression coverage includes batch-capacity enforcement, dependency
+  blocking, dependency recovery, lease release, and cancellation winning over
+  a late worker success.
+- Fresh complete non-smoke suite: `336 passed, 6 deselected, 1 warning`.
+- Fresh checks: Ruff, mypy for `manager_api`, Python compileall, and
+  `git diff --check` all passed.
+- Frontend validation with the bundled Node runtime passed `tsc -b` and
+  Vite production build (`1578 modules transformed`).
+
+## Railway Connectivity via Clash
+
+- Direct TCP access remains unavailable from this workstation.
+- Through local Clash HTTP `127.0.0.1:7890`, PostgreSQL returned `SELECT 1`,
+  Redis returned `PING=True`, and `/health/ready` reported both dependencies
+  as `ok` on 2026-08-28.
+- The probe did not write application data and did not print connection
+  credentials.

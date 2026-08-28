@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from ...api.dependencies import get_db
+from ...schemas.balances import BalanceResponse
 from ...schemas.bindings import (
     BindingConfirmRequest,
     BindingCreateRequest,
@@ -27,6 +28,7 @@ router = APIRouter(prefix="/api/bindings", tags=["bindings"])
 
 def _response(view: BindingView) -> BindingResponse:
     """Convert a binding view to public-only response data."""
+    snapshot = view.binding.balance_snapshot
     return BindingResponse(
         id=view.binding.id,
         social_account_id=view.binding.social_account_id,
@@ -38,6 +40,28 @@ def _response(view: BindingView) -> BindingResponse:
         bound_at=view.binding.bound_at,
         external_reference=view.binding.external_reference,
         archived_at=view.binding.archived_at,
+        balance=(
+            BalanceResponse(
+                id=snapshot.id,
+                binding_id=view.binding.id,
+                account_handle=view.account.handle,
+                wallet_address=view.wallet.address,
+                points=snapshot.points,
+                cash_hsk_available=snapshot.cash_hsk_available,
+                positions_value_hsk=snapshot.positions_value_hsk,
+                total_hsk=(
+                    snapshot.cash_hsk_available + snapshot.positions_value_hsk
+                    if snapshot.cash_hsk_available is not None
+                    and snapshot.positions_value_hsk is not None
+                    else None
+                ),
+                sync_status=snapshot.sync_status,
+                error_code=snapshot.error_code,
+                last_synced_at=snapshot.last_synced_at,
+            )
+            if snapshot is not None
+            else None
+        ),
     )
 
 

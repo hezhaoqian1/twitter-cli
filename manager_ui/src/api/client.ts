@@ -29,6 +29,21 @@ export type Binding = {
   bound_at: string | null;
   external_reference: string | null;
   archived_at: string | null;
+  balance: Balance | null;
+};
+
+export type Balance = {
+  id: string | null;
+  binding_id: string;
+  account_handle: string;
+  wallet_address: string;
+  points: number | string | null;
+  cash_hsk_available: number | string | null;
+  positions_value_hsk: number | string | null;
+  total_hsk: number | string | null;
+  sync_status: string;
+  error_code: string | null;
+  last_synced_at: string | null;
 };
 
 export type TaskEvent = {
@@ -43,13 +58,14 @@ export type TaskEvent = {
 
 export type Task = {
   id: string;
-  kind: "bind" | "repost" | "claim" | "verify_account";
+  kind: "bind" | "repost" | "claim" | "verify_account" | "balance_sync";
   state: string;
   attempt: number;
   priority: number;
   social_account_id: string | null;
   wallet_id: string | null;
   binding_id: string | null;
+  depends_on_task_id: string | null;
   idempotency_key: string;
   lease_keys: string[];
   scheduled_at: string;
@@ -68,6 +84,7 @@ export type TaskBatch = {
   id: string;
   name: string;
   kind: Task["kind"];
+  workflow_type: string;
   state: string;
   dispatch_limit: number;
   created_at: string;
@@ -79,6 +96,14 @@ export type VaultStatus = {
   initialized: boolean;
   unlocked: boolean;
   initialized_at: string | null;
+};
+
+export type VaultBackupSummary = {
+  format_version: number;
+  table_count: number;
+  row_count: number;
+  vault_recovery_key_valid: boolean;
+  checksums_valid: boolean;
 };
 
 export type AccountImportRow = {
@@ -167,6 +192,42 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function requestForm<T>(path: string, form: FormData): Promise<T> {
+  const response = await fetch(path, { method: "POST", body: form });
+  if (!response.ok) {
+    let message = "请求未完成";
+    try {
+      const body = (await response.json()) as { detail?: string };
+      if (body.detail) message = body.detail;
+    } catch {
+      // API restarting or returning a non-JSON error; keep the UI concise.
+    }
+    throw new ApiError(response.status, message);
+  }
+  return response.json() as Promise<T>;
+}
+
+async function requestBackup(path: string, form: FormData) {
+  const response = await fetch(path, { method: "POST", body: form });
+  if (!response.ok) {
+    let message = "备份请求未完成";
+    try {
+      const body = (await response.json()) as { detail?: string };
+      if (body.detail) message = body.detail;
+    } catch {
+      // Keep binary download failures readable without exposing response details.
+    }
+    throw new ApiError(response.status, message);
+  }
+  return {
+    blob: await response.blob(),
+    filename: response.headers.get("Content-Disposition")?.match(/filename="([^"]+)"/)?.[1] ?? "manager-backup.json",
+    formatVersion: response.headers.get("X-Backup-Format-Version"),
+    tableCount: response.headers.get("X-Backup-Table-Count"),
+    rowCount: response.headers.get("X-Backup-Row-Count")
+  };
+}
+
 export const api = {
   vaultStatus: () => request<VaultStatus>("/api/vault/status"),
   initializeVault: (password: string) =>
@@ -180,9 +241,27 @@ export const api = {
       body: JSON.stringify({ password })
     }),
   lockVault: () => request<VaultStatus>("/api/vault/lock", { method: "POST" }),
+  createBackup: (recoveryKey: string) => {
+    const form = new FormData();
+    form.set("recovery_key", recoveryKey);
+    return requestBackup("/api/vault/backups", form);
+  },
+  verifyBackup: (recoveryKey: string, packageFile: File) => {
+    const form = new FormData();
+    form.set("recovery_key", recoveryKey);
+    form.set("package", packageFile);
+    return requestForm<VaultBackupSummary>("/api/vault/backups/verify", form);
+  },
+  restoreBackup: (recoveryKey: string, packageFile: File) => {
+    const form = new FormData();
+    form.set("recovery_key", recoveryKey);
+    form.set("package", packageFile);
+    return requestForm<VaultBackupSummary & { restored: boolean }>("/api/vault/restore", form);
+  },
   accounts: () => request<Page<Account>>("/api/accounts?limit=500"),
   wallets: () => request<Page<Wallet>>("/api/wallets?limit=500"),
   bindings: () => request<Page<Binding>>("/api/bindings?limit=500"),
+  balances: () => request<Page<Balance>>("/api/balances?limit=500"),
   tasks: () => request<Page<Task>>("/api/tasks?limit=500"),
   taskBatches: () => request<Page<TaskBatch>>("/api/tasks/batches?limit=100"),
   previewAccountImport: (content: string, sourceName: string) =>
@@ -253,6 +332,27 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input)
     }),
+  createWorkflowBatch: (input: {
+    name: string;
+    dispatch_limit: number;
+    items: Array<{
+      social_account_id: string;
+      wallet_id: string;
+      repost_target: string;
+      priority?: number;
+    }>;
+  }) =>
+    request<TaskBatch>("/api/tasks/workflows", {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
   taskCommand: (id: string, command: "pause" | "cancel" | "retry" | "poll") =>
-    request<Task>(`/api/tasks/${id}/${command}`, { method: "POST" })
+    request<Task>(`/api/tasks/${id}/${command}`, { method: "POST" }),
+  batchCommand: (id: string, command: "pause" | "resume" | "cancel") =>
+    request<TaskBatch>(`/api/tasks/batches/${id}/${command}`, { method: "POST" }),
+  syncBalances: (bindingIds?: string[]) =>
+    request<{ task_ids: string[]; queued: number }>("/api/balances/sync", {
+      method: "POST",
+      body: JSON.stringify({ binding_ids: bindingIds?.length ? bindingIds : null })
+    })
 };

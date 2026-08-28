@@ -97,6 +97,7 @@ class BindingService:
             options=(
                 joinedload(AccountWalletBinding.account),
                 joinedload(AccountWalletBinding.wallet),
+                joinedload(AccountWalletBinding.balance_snapshot),
             ),
         )
         if binding is None:
@@ -161,6 +162,7 @@ class BindingService:
             .options(
                 joinedload(AccountWalletBinding.account),
                 joinedload(AccountWalletBinding.wallet),
+                joinedload(AccountWalletBinding.balance_snapshot),
             )
             .order_by(AccountWalletBinding.created_at, AccountWalletBinding.id)
             .offset(offset)

@@ -275,6 +275,15 @@ class FakeWorkflow(AbstractContextManager["FakeWorkflow"]):
         self.calls.append("claim")
         return self.action_payload
 
+    def account_summary(
+        self,
+        account: AccountMaterial,
+        wallet: WalletMaterial,
+        operation: OperationMaterial,
+    ) -> object:
+        self.calls.append("account_summary")
+        return self.action_payload
+
 
 def test_kredo_bind_maps_external_pending_and_closes_context() -> None:
     contexts: list[list[str]] = []
@@ -391,6 +400,32 @@ def test_kredo_status_normalizes_unbound_as_pending() -> None:
     assert result.status is ExternalStatus.PENDING
     assert result.operation_ref == "bind-fixture"
     assert calls == ["enter", "status", "exit"]
+
+
+def test_kredo_account_summary_extracts_nested_points_and_hsk_fields() -> None:
+    calls: list[str] = []
+    workflow = FakeWorkflow(
+        status_payload={},
+        action_payload={
+            "data": {
+                "points": 1250,
+                "cashHsk": {"available": "12.50"},
+                "portfolio": {"positionsValueHsk": 3.75},
+            }
+        },
+        calls=calls,
+    )
+
+    result = KredoAdapter(lambda _: workflow).account_summary(
+        ACCOUNT,
+        WALLET,
+        OperationMaterial(kind="balance_sync"),
+    )
+
+    assert result.points == 1250
+    assert result.cash_hsk_available == 12.50
+    assert result.positions_value_hsk == 3.75
+    assert calls == ["enter", "account_summary", "exit"]
 
 
 def test_kredo_workflow_errors_are_typed_without_provider_message() -> None:

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
 from typing import Callable
 from uuid import UUID
 
@@ -14,17 +12,7 @@ from .queue import TaskMessage, TaskQueue
 from .repositories.leases import LeaseRepository
 from .scheduler import DispatchGrant, Scheduler
 from .services.tasks import TaskConflictError, TaskService
-
-
-@dataclass(frozen=True)
-class WorkerOutcome:
-    """Redacted handler result mapped to the durable task state machine."""
-
-    state: TaskState
-    summary: str | None = None
-    external_operation_ref: str | None = None
-    failure_code: str | None = None
-    next_poll_at: datetime | None = None
+from .task_outcomes import WorkerOutcome
 
 
 WorkerHandler = Callable[[TaskJob], WorkerOutcome]
@@ -65,6 +53,12 @@ class TaskWorker:
                     "invalid_worker_outcome",
                     "worker handler returned an unsupported terminal state",
                 )
+            if self._cancel_requested(job):
+                return tasks.transition(
+                    job.id,
+                    TaskState.CANCELLED,
+                    summary="worker stopped after cancellation request",
+                )
             return tasks.transition(
                 job.id,
                 outcome.state,
@@ -74,6 +68,12 @@ class TaskWorker:
                 next_poll_at=outcome.next_poll_at,
             )
         except TaskConflictError:
+            if self._cancel_requested(job):
+                return tasks.transition(
+                    job.id,
+                    TaskState.CANCELLED,
+                    summary="worker stopped after cancellation request",
+                )
             tasks.transition(
                 job.id,
                 TaskState.FAILED,
@@ -84,6 +84,12 @@ class TaskWorker:
         except Exception:
             # Error details stay out of task events; adapters can return a
             # typed failure code through WorkerOutcome when it is safe to show.
+            if self._cancel_requested(job):
+                return tasks.transition(
+                    job.id,
+                    TaskState.CANCELLED,
+                    summary="worker stopped after cancellation request",
+                )
             tasks.transition(
                 job.id,
                 TaskState.FAILED,
@@ -101,6 +107,11 @@ class TaskWorker:
     def recover_expired(self) -> list[UUID]:
         """Run the durable recovery sweep for crashed or stopped workers."""
         return self.scheduler.recover_expired()
+
+    def _cancel_requested(self, job: TaskJob) -> bool:
+        """Reload only the cancellation marker without disturbing datetime values."""
+        self.session.expire(job, ["cancel_requested_at"])
+        return job.cancel_requested_at is not None
 
     def run_message(
         self,
