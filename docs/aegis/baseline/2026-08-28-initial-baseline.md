@@ -1,6 +1,6 @@
 # twitter-cli Initial Baseline
 
-Date: `2026-08-28`  
+Date: `2026-08-28`
 Status: `initial dual-baseline snapshot`
 
 ## 1. Purpose

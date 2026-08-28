@@ -25,6 +25,14 @@ VAULT_FORMAT_VERSION = 1
 KEY_BYTES = 32
 NONCE_BYTES = 12
 DEFAULT_CACHE_TTL_SECONDS = 900.0
+BACKUP_KDF_PARAMETERS: dict[str, int | str] = {
+    "algorithm": "argon2id",
+    "time_cost": 3,
+    "memory_cost": 64 * 1024,
+    "parallelism": 2,
+    "hash_len": KEY_BYTES,
+    "version": 19,
+}
 KDF_PARAMETERS: dict[str, int | str] = {
     "algorithm": "argon2id",
     "time_cost": 3,
@@ -48,6 +56,49 @@ class VaultUnlockError(VaultError):
     """Raised without revealing whether a vault exists or a secret matched."""
 
 
+class VaultRuntime:
+    """Hold one unwrapped vault key for the lifetime of the API process."""
+
+    def __init__(
+        self,
+        *,
+        cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if cache_ttl_seconds <= 0:
+            raise ValueError("cache_ttl_seconds must be positive")
+        self.cache_ttl_seconds = cache_ttl_seconds
+        self._clock = clock
+        self._vault_key: bytes | None = None
+        self._unlocked_until = 0.0
+
+    @property
+    def is_unlocked(self) -> bool:
+        """Return whether the process-local key is inside its TTL window."""
+        if self._vault_key is None:
+            return False
+        if self._clock() >= self._unlocked_until:
+            self.lock()
+            return False
+        return True
+
+    def get_key(self) -> bytes | None:
+        """Return the cached key while it is valid, otherwise expire it."""
+        if not self.is_unlocked:
+            return None
+        return self._vault_key
+
+    def set_key(self, vault_key: bytes) -> None:
+        """Cache the unwrapped key until the configured expiry."""
+        self._vault_key = vault_key
+        self._unlocked_until = self._clock() + self.cache_ttl_seconds
+
+    def lock(self) -> None:
+        """Erase the process-local reference to the unwrapped key."""
+        self._vault_key = None
+        self._unlocked_until = 0.0
+
+
 @dataclass(frozen=True)
 class VaultInitialization:
     """Initialization result containing the one-time recovery key."""
@@ -65,24 +116,30 @@ class VaultService:
         *,
         cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        runtime: VaultRuntime | None = None,
     ) -> None:
-        if cache_ttl_seconds <= 0:
-            raise ValueError("cache_ttl_seconds must be positive")
         self.session = session
-        self.cache_ttl_seconds = cache_ttl_seconds
-        self._clock = clock
-        self._vault_key: bytes | None = None
-        self._unlocked_until = 0.0
+        self.runtime = runtime or VaultRuntime(
+            cache_ttl_seconds=cache_ttl_seconds,
+            clock=clock,
+        )
 
     @property
     def is_unlocked(self) -> bool:
         """Return whether the in-memory key is still inside its TTL window."""
-        if self._vault_key is None:
-            return False
-        if self._clock() >= self._unlocked_until:
-            self.lock()
-            return False
-        return True
+        return self.runtime.is_unlocked
+
+    @property
+    def initialized(self) -> bool:
+        """Return whether an active vault metadata record exists."""
+        metadata = self._get_metadata()
+        return metadata is not None and metadata.active
+
+    @property
+    def initialized_at(self):
+        """Return the initialization timestamp without exposing key material."""
+        metadata = self._get_metadata()
+        return metadata.initialized_at if metadata is not None and metadata.active else None
 
     def initialize(
         self,
@@ -185,13 +242,79 @@ class VaultService:
 
     def lock(self) -> None:
         """Erase the process-local reference to the unwrapped key."""
-        self._vault_key = None
-        self._unlocked_until = 0.0
+        self.runtime.lock()
 
     def fingerprint(self, value: str | bytes) -> str:
         """Return a stable non-reversible fingerprint for duplicate detection."""
         payload = value.encode("utf-8") if isinstance(value, str) else value
         return hashlib.sha256(payload).hexdigest()
+
+    def verify_recovery_key(self, recovery_key: str) -> bool:
+        """Validate a recovery key without exposing or persisting vault material."""
+        metadata = self._get_metadata()
+        if not recovery_key or metadata is None or not metadata.active:
+            return False
+        try:
+            self._unwrap_vault_key(metadata, recovery_key)
+        except (InvalidTag, KeyError, TypeError, ValueError, VaultError):
+            return False
+        return True
+
+    def verify_wrapped_recovery_key(
+        self,
+        wrapped: bytes,
+        salt: bytes,
+        parameters: dict[str, Any],
+        recovery_key: str,
+    ) -> bytes:
+        """Validate a serialized recovery wrap from a backup snapshot."""
+        vault_key = self._unwrap_key(
+            wrapped,
+            self._derive_key(recovery_key, salt, parameters),
+            purpose="recovery",
+        )
+        self._ensure_key_length(vault_key)
+        return vault_key
+
+    def encrypt_backup_payload(self, payload: bytes, recovery_key: str) -> dict[str, object]:
+        """Encrypt a complete backup payload with an independent recovery-key wrap."""
+        metadata = self._get_metadata()
+        if metadata is None or not metadata.active:
+            raise VaultError("vault is not initialized")
+        self._unwrap_vault_key(metadata, recovery_key)
+        salt = secrets.token_bytes(16)
+        nonce = secrets.token_bytes(NONCE_BYTES)
+        wrapping_key = self._derive_key(recovery_key, salt, BACKUP_KDF_PARAMETERS)
+        aad = f"manager-vault-backup:v{VAULT_FORMAT_VERSION}".encode("ascii")
+        ciphertext = AESGCM(wrapping_key).encrypt(nonce, payload, aad)
+        return {
+            "format_version": VAULT_FORMAT_VERSION,
+            "kdf": dict(BACKUP_KDF_PARAMETERS),
+            "salt": self._encode(salt),
+            "nonce": self._encode(nonce),
+            "ciphertext": self._encode(ciphertext),
+        }
+
+    def decrypt_backup_payload(
+        self,
+        envelope: dict[str, object],
+        recovery_key: str,
+    ) -> bytes:
+        """Decrypt a backup package and map all cryptographic failures to one error."""
+        try:
+            if envelope["format_version"] != VAULT_FORMAT_VERSION:
+                raise VaultError("unsupported backup format")
+            parameters = envelope["kdf"]
+            if not isinstance(parameters, dict):
+                raise VaultError("invalid backup KDF")
+            salt = self._decode(str(envelope["salt"]))
+            nonce = self._decode(str(envelope["nonce"]))
+            ciphertext = self._decode(str(envelope["ciphertext"]))
+            wrapping_key = self._derive_key(recovery_key, salt, parameters)
+            aad = f"manager-vault-backup:v{VAULT_FORMAT_VERSION}".encode("ascii")
+            return AESGCM(wrapping_key).decrypt(nonce, ciphertext, aad)
+        except (InvalidTag, KeyError, TypeError, ValueError, UnicodeDecodeError, VaultError) as exc:
+            raise VaultUnlockError(GENERIC_UNLOCK_ERROR) from exc
 
     def _unlock(self, secret: str, *, mode: str) -> None:
         metadata = self._get_metadata()
@@ -206,10 +329,8 @@ class VaultService:
                 salt = metadata.recovery_salt
                 parameters = metadata.recovery_kdf
                 wrapped = metadata.wrapped_with_recovery
-            wrapping_key = self._derive_key(secret, salt, parameters)
-            vault_key = self._unwrap_key(wrapped, wrapping_key, purpose=mode)
-            if len(vault_key) != KEY_BYTES:
-                raise VaultUnlockError(GENERIC_UNLOCK_ERROR)
+            vault_key = self._unwrap_key(wrapped, self._derive_key(secret, salt, parameters), purpose=mode)
+            self._ensure_key_length(vault_key)
         except (InvalidTag, KeyError, TypeError, ValueError, VaultError) as exc:
             self.lock()
             raise VaultUnlockError(GENERIC_UNLOCK_ERROR) from exc
@@ -223,14 +344,28 @@ class VaultService:
         )
 
     def _require_key(self) -> bytes:
-        if not self.is_unlocked:
+        key = self.runtime.get_key()
+        if key is None:
             raise VaultUnlockError("vault is locked")
-        assert self._vault_key is not None
-        return self._vault_key
+        return key
 
     def _set_unlocked(self, vault_key: bytes) -> None:
-        self._vault_key = vault_key
-        self._unlocked_until = self._clock() + self.cache_ttl_seconds
+        self.runtime.set_key(vault_key)
+
+    @staticmethod
+    def _ensure_key_length(vault_key: bytes) -> None:
+        """Reject malformed wrapped keys before they reach AES-GCM."""
+        if len(vault_key) != KEY_BYTES:
+            raise VaultError("invalid vault key")
+
+    def _unwrap_vault_key(self, metadata: VaultMetadata, recovery_key: str) -> bytes:
+        """Unwrap the persisted vault key for recovery-key validation."""
+        return self.verify_wrapped_recovery_key(
+            metadata.wrapped_with_recovery,
+            metadata.recovery_salt,
+            metadata.recovery_kdf,
+            recovery_key,
+        )
 
     @staticmethod
     def _new_recovery_key() -> str:

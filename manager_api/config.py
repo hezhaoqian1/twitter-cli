@@ -23,6 +23,7 @@ class ManagerSettings(BaseSettings):
     session_secret: str = Field(..., min_length=16)
     worker_concurrency: int = Field(default=3, ge=1, le=32)
     browser_concurrency: int = Field(default=2, ge=1, le=16)
+    vault_cache_ttl_seconds: float = Field(default=900.0, gt=0, le=86400)
     external_poll_interval_seconds: float = Field(default=15.0, gt=0, le=3600)
     external_poll_timeout_seconds: float = Field(default=900.0, gt=0, le=86400)
     healthcheck_timeout_seconds: float = Field(default=3.0, gt=0, le=30)

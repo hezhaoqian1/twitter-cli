@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from ...api.dependencies import get_db
+from ...api.dependencies import get_db, get_vault
 from ...schemas.accounts import (
     AccountImportCommitResponse,
     AccountImportPreviewResponse,
@@ -14,6 +14,7 @@ from ...schemas.accounts import (
     AccountImportSummary,
 )
 from ...services.imports import AccountImportService, ImportPreview, summarize_preview
+from ...services.vault import VaultService, VaultUnlockError
 
 router = APIRouter(prefix="/api/imports", tags=["imports"])
 
@@ -66,12 +67,16 @@ def preview_accounts(
 def commit_accounts(
     request: AccountImportRequest,
     session: Session = Depends(get_db),
+    vault: VaultService = Depends(get_vault),
 ) -> AccountImportCommitResponse:
     """Persist valid rows after encrypting each secret field."""
-    batch, preview = AccountImportService(session).commit(
-        request.content.get_secret_value(),
-        source_name=request.source_name,
-    )
+    try:
+        batch, preview = AccountImportService(session, vault).commit(
+            request.content.get_secret_value(),
+            source_name=request.source_name,
+        )
+    except VaultUnlockError as exc:
+        raise HTTPException(status_code=423, detail="vault is locked") from exc
     return AccountImportCommitResponse(
         import_batch_id=batch.id,
         source_sha256=batch.source_sha256,

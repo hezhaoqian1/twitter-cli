@@ -9,8 +9,13 @@ from fastapi import FastAPI
 from sqlalchemy import create_engine, text
 
 from .api.routers.accounts import router as accounts_router
+from .api.routers.bindings import router as bindings_router
 from .api.routers.imports import router as imports_router
+from .api.routers.vault import router as vault_router
+from .api.routers.wallets import router as wallets_router
+from .api.routers.tasks import router as tasks_router
 from .config import ManagerSettings, get_settings
+from .services.vault import VaultRuntime
 
 Probe = Callable[[], None]
 
@@ -56,9 +61,16 @@ def create_app(
     check_postgres = postgres_probe or (lambda: _postgres_probe(runtime))
     check_redis = redis_probe or (lambda: _redis_probe(runtime))
 
-    app = FastAPI(title="Account Wallet Task Manager", version="0.1.0")
+    app = FastAPI(title="Account Wallet Task Manager", version="0.9.0")
+    app.state.vault_runtime = VaultRuntime(
+        cache_ttl_seconds=runtime.vault_cache_ttl_seconds,
+    )
     app.include_router(imports_router)
     app.include_router(accounts_router)
+    app.include_router(bindings_router)
+    app.include_router(vault_router)
+    app.include_router(wallets_router)
+    app.include_router(tasks_router)
 
     @app.get("/health/live")
     def live() -> dict[str, str]:

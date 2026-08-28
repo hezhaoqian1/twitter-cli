@@ -1,7 +1,7 @@
 # Account, Wallet, and Task Manager Design
 
-Date: `2026-08-28`  
-Status: `proposed for user review`  
+Date: `2026-08-28`
+Status: `proposed for user review`
 Scope: local-first, single-administrator management application
 
 Deployment decision: Railway is the target managed-hosting platform for the

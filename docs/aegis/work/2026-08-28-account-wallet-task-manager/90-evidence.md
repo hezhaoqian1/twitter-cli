@@ -97,3 +97,124 @@ Date: `2026-08-28`
 - Focused import and redaction suite: `5 passed`.
 - Full non-smoke suite: `275 passed, 6 deselected`.
 - Ruff, mypy, compileall, and `git diff --check` completed successfully.
+
+## Batch 2, Task 6: Binding Evidence
+
+- Binding service suite: `4 passed`.
+- Pending intents require active, unbound account and wallet resources.
+- Confirming a binding records `bound_at` and an external reference; repeated
+  confirmation with the same reference is idempotent.
+- Confirmed pairings reject changes and remain non-reassignable after archive.
+- Archived resources, active binding intents, historical confirmed bindings,
+  and current account/wallet leases return distinct conflict codes.
+- Binding API routes are registered and list responses contain public identity
+  fields only.
+- Full non-smoke suite after binding work: `287 passed, 6 deselected`.
+- Ruff, mypy, compileall, and `git diff --check` completed successfully.
+
+## Vault HTTP Runtime Wiring Evidence
+
+- Focused Vault/import/runtime suite: `14 passed`.
+- `VaultRuntime` is shared by request-scoped `VaultService` instances and
+  expires or clears the in-memory key according to the configured TTL.
+- Vault HTTP routes expose only status, lifecycle results, and the one-time
+  recovery key; password and recovery inputs use `SecretStr` request schemas.
+- Account commit receives the shared runtime-backed Vault service instead of
+  constructing an isolated locked service.
+- `mypy` and Ruff checks for the changed manager API/Vault files passed.
+
+## Batch 2, Task 5: Wallet Evidence
+
+- Wallet derivation and validation suite: `5 passed`.
+- MetaMask-compatible BIP-44 derivation is verified against generated fixture
+  addresses for multiple indices.
+- Private-key input accepts canonical `0x` or raw 32-byte hexadecimal and
+  stores only encrypted source/private-key material.
+- Duplicate normalized addresses are classified and skipped without creating
+  a second wallet record.
+- Wallet preview/commit/derive/list routes are registered and use the shared
+  in-memory Vault runtime for encrypted operations.
+- Wallet API redaction test verifies that mnemonic material is absent from
+  responses and that a locked Vault returns `423`.
+- Focused manager suite after wallet routing: `13 passed`.
+- Full non-smoke suite after wallet routing: `283 passed, 6 deselected`.
+- Ruff, mypy, compileall, and `git diff --check` completed successfully.
+
+## Batch 2, Task 7: Task State Evidence
+
+- Task creation derives a deterministic idempotency key from task kind,
+  resource/binding scope, and a SHA-256 digest of the external target; raw
+  targets are not exposed in task responses.
+- Duplicate active task creation reuses the existing durable job, including
+  under a uniqueness race, while retries keep the same idempotency boundary
+  and increment `attempt`.
+- Permitted state transitions, pause/cancel/retry/poll rules, lease ownership
+  checks, and expired-lease recovery are enforced by `TaskService`.
+- Every state mutation appends one redacted, ordered event in the same
+  transaction boundary as the job update.
+
+## Batch 3, Task 8: Lease, Queue, and Worker Evidence
+
+- Lease acquisition deduplicates resource keys and grants all account/wallet
+  keys atomically; a conflicting key produces no partial grant.
+- Scheduler capacity respects worker and browser concurrency limits and
+  selects eligible jobs round-robin across batches.
+- Lease release requires the matching owner token; expired leases are removed
+  before replacement and recovered jobs return to `queued` with a recorded
+  recovery event.
+- Redis reliable-list messages contain only task and lease identifiers;
+  acknowledgement occurs after durable worker completion, and failed message
+  handling requeues the payload.
+- Worker success, typed invalid outcomes, exception redaction, graceful
+  shutdown, and expired-lease recovery are covered by deterministic tests.
+- Focused lease/worker suite: `6 passed`.
+
+## Batch 4, Task 9: Normalized Adapter Evidence
+
+- `XAdapter` bridges the existing `twitter_cli` client contract for account
+  verification and repost actions without owning transport setup.
+- `KredoAdapter` isolates each bind, repost, claim, and status call in a
+  factory-owned workflow context, maps provider state aliases to normalized
+  task states, and preflights delayed or already-completed repost/claim work.
+- Adapter material has secret-safe representations; nested evidence and typed
+  provider errors are redacted before they cross into task events.
+- Adapter fake suite: `14 passed in 0.46s`.
+
+## Batch 4, Task 10: Operations UI Evidence
+
+- The React/Vite UI builds successfully with the bundled workspace Node:
+  `tsc -b` followed by `vite build`.
+- Production build result: `1578 modules transformed`; generated assets were
+  `dist/index.html`, CSS, and JavaScript bundles.
+- Responsive layout was visually checked at mobile, tablet, and desktop
+  widths using:
+  `/tmp/hashkey-manager-layout-v2-mobile.png`,
+  `/tmp/hashkey-manager-layout-v2-tablet.png`, and
+  `/tmp/hashkey-manager-layout-v2-desktop.png`.
+- Browser verification observed HTTP 200 API requests and no new application
+  errors. The tablet task area now switches to a stacked layout at the
+  `max-width: 900px` breakpoint.
+
+## Current Verification Baseline
+
+- Fresh complete non-smoke suite: `318 passed, 6 deselected, 1 warning in
+  11.58s`.
+- Fresh adapter suite: `14 passed in 0.46s`.
+- Fresh static checks: Ruff, Mypy, compileall, and `git diff --check` passed.
+- Fresh frontend production build: Vite completed successfully in `1.54s`.
+- Aegis workspace `check` and `bundle` commands completed with exit status 0;
+  these validate workspace structure and packaging, not external evidence
+  sufficiency.
+
+## Closed-Slice Boundary
+
+- Batch 4 adapters and UI are complete based on synthetic backend tests,
+  static checks, production build output, and visual browser checks.
+- Provider credentials, cookies, wallet keys, recovery material, and hosted
+  database/Redis connection values remain excluded from source, fixtures,
+  logs, and evidence.
+- Live PostgreSQL/Redis startup and migration smoke remain outstanding because
+  the local Docker daemon is unavailable; readiness currently reports
+  PostgreSQL `down` and Redis `ok`.
+- Encrypted backup/restore and Railway deployment verification are the next
+  implementation slices.

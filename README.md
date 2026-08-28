@@ -496,10 +496,53 @@ twitter follow elonmusk --json
 
 认证优先级：
 
-1. **环境变量**：`TWITTER_AUTH_TOKEN` + `TWITTER_CT0`
-2. **浏览器提取**（推荐）：Arc/Chrome/Edge/Firefox/Brave 全量 Cookie 提取
+1. **完整 Cookie 文件**：`TWITTER_COOKIE_FILE=/path/to/session.json`
+2. **环境变量**：`TWITTER_AUTH_TOKEN` + `TWITTER_CT0`
+3. **浏览器提取**（推荐）：Arc/Chrome/Edge/Firefox/Brave 全量 Cookie 提取
 
 推荐使用浏览器提取方式，会转发所有 Twitter Cookie，并按本机运行环境生成语言和平台请求头；它比仅发送 `auth_token` + `ct0` 更接近普通浏览器流量，但不等于完整浏览器自动化。
+
+### 自动登录并导出 Cookie
+
+仓库附带 `scripts/x_login_export.py`，可在可见 Chrome 窗口中使用账号、密码和 TOTP 密钥登录，然后导出完整会话：
+
+```bash
+export X_USERNAME="登录账号"
+export X_PASSWORD="登录密码"
+export X_TOTP_SECRET="2FA_TOTP密钥"
+
+uv run --with playwright python scripts/x_login_export.py
+export TWITTER_COOKIE_FILE="$PWD/.twitter-session.json"
+twitter status --yaml
+```
+
+也可以只用 `auth_token` 登录。脚本会把 token 写入临时浏览器 Profile，访问 X 后导出站点刷新出来的 `ct0` 和完整 Cookie：
+
+```bash
+export X_AUTH_TOKEN="auth_token"
+
+uv run --with playwright python scripts/x_login_export.py --output .twitter-session-token.json
+export TWITTER_COOKIE_FILE="$PWD/.twitter-session-token.json"
+twitter status --yaml
+```
+
+首次运行若本机没有 Playwright 浏览器，可执行：
+
+```bash
+uv run --with playwright playwright install chromium
+```
+
+脚本默认把会话写入 `.twitter-session.json`，文件权限为 `600`，且该文件已被 Git 忽略。X 出现一次性安全挑战时，脚本会保留可见浏览器窗口，完成挑战后自动继续导出。
+
+### 批量验证 Cookie
+
+对于 `登录账号 密码 2FA 邮箱 邮箱密码 token Cookie` 这种 TSV，可用批量脚本做只读认证检查：
+
+```bash
+uv run python scripts/x_cookie_batch_status.py /path/to/accounts.tsv --repo "$PWD"
+```
+
+脚本会把每行 Base64 Cookie 转成临时 session 文件，再通过 `TWITTER_COOKIE_FILE` 调用 `twitter status --yaml`。验证过的完整流程记录在 [docs/x-cookie-auth-flow.md](docs/x-cookie-auth-flow.md)。
 
 **Chrome 多 Profile 支持**：会自动遍历所有 Chrome profile。也可以通过环境变量指定：
 

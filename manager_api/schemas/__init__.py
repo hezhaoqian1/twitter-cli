@@ -9,11 +9,37 @@ from .accounts import (
     AccountListItem,
     AccountListResponse,
 )
+from .bindings import (
+    BindingConfirmRequest,
+    BindingCreateRequest,
+    BindingListResponse,
+    BindingResponse,
+)
 from .vault import (
+    VaultBackupResponse,
+    VaultInitializeRequest,
     VaultInitializeResponse,
     VaultPasswordRequest,
     VaultRecoveryKeyRequest,
+    VaultRestoreResponse,
     VaultStatusResponse,
+)
+from .wallets import (
+    WalletDeriveRequest,
+    WalletImportCommitResponse,
+    WalletImportPreviewResponse,
+    WalletImportRequest,
+    WalletImportSummary,
+    WalletListItem,
+    WalletListResponse,
+    WalletPreviewItem,
+)
+from .tasks import (
+    TaskCreateRequest,
+    TaskEventResponse,
+    TaskListResponse,
+    TaskResponse,
+    TaskTransitionRequest,
 )
 
 __all__ = [
@@ -24,8 +50,28 @@ __all__ = [
     "AccountImportSummary",
     "AccountListItem",
     "AccountListResponse",
+    "BindingConfirmRequest",
+    "BindingCreateRequest",
+    "BindingListResponse",
+    "BindingResponse",
+    "VaultInitializeRequest",
     "VaultInitializeResponse",
+    "VaultBackupResponse",
     "VaultPasswordRequest",
     "VaultRecoveryKeyRequest",
+    "VaultRestoreResponse",
     "VaultStatusResponse",
+    "WalletDeriveRequest",
+    "WalletImportCommitResponse",
+    "WalletImportPreviewResponse",
+    "WalletImportRequest",
+    "WalletImportSummary",
+    "WalletListItem",
+    "WalletListResponse",
+    "WalletPreviewItem",
+    "TaskCreateRequest",
+    "TaskEventResponse",
+    "TaskListResponse",
+    "TaskResponse",
+    "TaskTransitionRequest",
 ]
