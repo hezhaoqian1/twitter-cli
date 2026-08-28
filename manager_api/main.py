@@ -15,6 +15,7 @@ from .api.routers.imports import router as imports_router
 from .api.routers.vault import router as vault_router
 from .api.routers.wallets import router as wallets_router
 from .api.routers.tasks import router as tasks_router
+from .api.routers.runtime import router as runtime_router
 from .config import ManagerSettings, get_settings
 from .services.vault import VaultRuntime
 
@@ -62,10 +63,12 @@ def create_app(
     check_postgres = postgres_probe or (lambda: _postgres_probe(runtime))
     check_redis = redis_probe or (lambda: _redis_probe(runtime))
 
-    app = FastAPI(title="Account Wallet Task Manager", version="0.9.0")
+    app = FastAPI(title="Account Wallet Task Manager", version="0.9.0.1")
+    app.state.settings = runtime
     app.state.vault_runtime = VaultRuntime(
         cache_ttl_seconds=runtime.vault_cache_ttl_seconds,
     )
+    app.state.redis_client = None
     app.include_router(imports_router)
     app.include_router(accounts_router)
     app.include_router(bindings_router)
@@ -73,6 +76,7 @@ def create_app(
     app.include_router(vault_router)
     app.include_router(wallets_router)
     app.include_router(tasks_router)
+    app.include_router(runtime_router)
 
     @app.get("/health/live")
     def live() -> dict[str, str]:

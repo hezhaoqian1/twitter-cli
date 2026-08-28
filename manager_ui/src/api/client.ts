@@ -151,6 +151,28 @@ export type WalletPreview = {
   }>;
 };
 
+export type RuntimeMetrics = {
+  generated_at: string;
+  queues: {
+    ready: number;
+    processing: number;
+  };
+  tasks: {
+    total: number;
+    active: number;
+    counts: Record<string, number>;
+    last_finished_at: string | null;
+  };
+  leases: {
+    active: number;
+    expiring_soon: number;
+  };
+  workers: {
+    active: number;
+    heartbeat_at: string | null;
+  };
+};
+
 type Page<T> = {
   items: T[];
   offset: number;
@@ -229,6 +251,7 @@ async function requestBackup(path: string, form: FormData) {
 }
 
 export const api = {
+  runtimeMetrics: () => request<RuntimeMetrics>("/api/runtime/metrics"),
   vaultStatus: () => request<VaultStatus>("/api/vault/status"),
   initializeVault: (password: string) =>
     request<{ initialized: boolean; recovery_key: string }>("/api/vault/initialize", {

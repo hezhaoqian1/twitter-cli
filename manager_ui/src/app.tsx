@@ -38,6 +38,7 @@ import {
   AccountImportResult,
   api,
   ApiError,
+  RuntimeMetrics,
   Task,
   TaskBatch,
   VaultBackupSummary,
@@ -367,6 +368,7 @@ function Overview({ refresh, onNavigate }: { refresh: number; onNavigate: (page:
   const wallets = useResource(api.wallets, refresh);
   const bindings = useResource(api.bindings, refresh);
   const tasks = useResource(api.tasks, refresh);
+  const runtime = useResource(api.runtimeMetrics, refresh);
   const summary = useMemo(() => {
     const taskItems = tasks.value?.items ?? [];
     return {
@@ -419,7 +421,39 @@ function Overview({ refresh, onNavigate }: { refresh: number; onNavigate: (page:
           </div>
         </Panel>
       </div>
+      <RuntimePanel runtime={runtime.value} loading={runtime.loading} error={runtime.error} />
     </div>
+  );
+}
+
+function RuntimePanel({
+  runtime,
+  loading,
+  error
+}: {
+  runtime: RuntimeMetrics | null;
+  loading: boolean;
+  error: string | null;
+}) {
+  return (
+    <Panel title="运行态" action={<span className="subtle-label">{runtime ? dateTime(runtime.generated_at) : "等待数据"}</span>}>
+      {loading ? (
+        <LoadingRows />
+      ) : error ? (
+        <EmptyState title="运行态暂不可用" detail={error} />
+      ) : runtime ? (
+        <div className="runtime-grid">
+          <StatusLine label="待处理队列" value={`${runtime.queues.ready}`} tone={runtime.queues.ready ? "warning" : "success"} />
+          <StatusLine label="处理中队列" value={`${runtime.queues.processing}`} tone={runtime.queues.processing ? "warning" : "neutral"} />
+          <StatusLine label="活跃租约" value={`${runtime.leases.active}`} tone={runtime.leases.active ? "warning" : "success"} />
+          <StatusLine label="即将过期租约" value={`${runtime.leases.expiring_soon}`} tone={runtime.leases.expiring_soon ? "danger" : "success"} />
+          <StatusLine label="活跃 Worker" value={`${runtime.workers.active}`} tone={runtime.workers.active ? "success" : "neutral"} />
+          <StatusLine label="最近完成" value={dateTime(runtime.tasks.last_finished_at)} tone="neutral" />
+        </div>
+      ) : (
+        <EmptyState title="暂无运行态" detail="启动管理 Worker 后，这里会显示队列与租约。" />
+      )}
+    </Panel>
   );
 }
 
