@@ -19,6 +19,7 @@ class TaskKind(StringEnum):
     REPOST = "repost"
     CLAIM = "claim"
     VERIFY_ACCOUNT = "verify_account"
+    BALANCE_SYNC = "balance_sync"
 
 
 class TaskState(StringEnum):
@@ -29,6 +30,7 @@ class TaskState(StringEnum):
     LEASED = "leased"
     RUNNING = "running"
     WAITING_EXTERNAL_VALIDATION = "waiting_external_validation"
+    BLOCKED = "blocked"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     PAUSED = "paused"
@@ -42,6 +44,7 @@ class TaskBatch(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     kind: Mapped[TaskKind] = mapped_column(nullable=False)
+    workflow_type: Mapped[str] = mapped_column(String(64), default="single", nullable=False)
     dispatch_limit: Mapped[int] = mapped_column(Integer, default=10, nullable=False)
     state: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
     paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -76,6 +79,10 @@ class TaskJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     binding_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("account_wallet_bindings.id", ondelete="RESTRICT")
     )
+    depends_on_task_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("task_jobs.id", ondelete="RESTRICT")
+    )
+    external_target: Mapped[str] = mapped_column(String(512), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False)
     lease_keys: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -89,6 +96,10 @@ class TaskJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     batch: Mapped[TaskBatch | None] = relationship(back_populates="jobs")
+    depends_on: Mapped["TaskJob | None"] = relationship(
+        remote_side="TaskJob.id",
+        foreign_keys=[depends_on_task_id],
+    )
     events: Mapped[list[TaskEvent]] = relationship(
         back_populates="job",
         cascade="all, delete-orphan",

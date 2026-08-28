@@ -20,8 +20,10 @@ from ...schemas.tasks import (
     TaskListResponse,
     TaskResponse,
     TaskTransitionRequest,
+    WorkflowBatchCreateRequest,
 )
 from ...services.tasks import TaskBatchItem, TaskError, TaskService
+from ...services.workflows import WorkflowBatchItem, WorkflowService
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -37,6 +39,7 @@ def _response(job: TaskJob) -> TaskResponse:
         social_account_id=job.social_account_id,
         wallet_id=job.wallet_id,
         binding_id=job.binding_id,
+        depends_on_task_id=job.depends_on_task_id,
         idempotency_key=job.idempotency_key,
         lease_keys=list(job.lease_keys),
         scheduled_at=job.scheduled_at,
@@ -69,6 +72,7 @@ def _batch_response(batch: TaskBatch) -> TaskBatchResponse:
         id=batch.id,
         name=batch.name,
         kind=batch.kind,
+        workflow_type=batch.workflow_type,
         state=batch.state,
         dispatch_limit=batch.dispatch_limit,
         created_at=batch.created_at,
@@ -144,6 +148,38 @@ def create_task_batch(
     return _batch_response(batch)
 
 
+@router.post("/workflows", response_model=TaskBatchResponse, status_code=201)
+def create_workflow_batch(
+    request: WorkflowBatchCreateRequest,
+    session: Session = Depends(get_db),
+) -> TaskBatchResponse:
+    """Create one ordered verify-bind-repost-claim chain per pair."""
+    try:
+        result = WorkflowService(session).create_batch(
+            name=request.name,
+            dispatch_limit=request.dispatch_limit,
+            items=[
+                WorkflowBatchItem(
+                    social_account_id=item.social_account_id,
+                    wallet_id=item.wallet_id,
+                    repost_target=item.repost_target,
+                    priority=item.priority,
+                )
+                for item in request.items
+            ],
+        )
+    except TaskError as exc:
+        _raise(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    batch = session.execute(
+        select(TaskBatch)
+        .where(TaskBatch.id == result.batch.id)
+        .options(joinedload(TaskBatch.jobs).joinedload(TaskJob.events))
+    ).unique().scalar_one()
+    return _batch_response(batch)
+
+
 @router.get("/batches", response_model=TaskBatchListResponse)
 def list_task_batches(
     offset: int = Query(default=0, ge=0),
@@ -165,6 +201,33 @@ def list_task_batches(
         limit=limit,
         total=total,
     )
+
+
+@router.post("/batches/{batch_id}/pause", response_model=TaskBatchResponse)
+def pause_task_batch(batch_id: UUID, session: Session = Depends(get_db)) -> TaskBatchResponse:
+    """Pause a batch and remove its queued work from future dispatch."""
+    try:
+        return _batch_response(TaskService(session).pause_batch(batch_id))
+    except TaskError as exc:
+        _raise(exc)
+
+
+@router.post("/batches/{batch_id}/resume", response_model=TaskBatchResponse)
+def resume_task_batch(batch_id: UUID, session: Session = Depends(get_db)) -> TaskBatchResponse:
+    """Resume a paused batch and requeue its paused child jobs."""
+    try:
+        return _batch_response(TaskService(session).resume_batch(batch_id))
+    except TaskError as exc:
+        _raise(exc)
+
+
+@router.post("/batches/{batch_id}/cancel", response_model=TaskBatchResponse)
+def cancel_task_batch(batch_id: UUID, session: Session = Depends(get_db)) -> TaskBatchResponse:
+    """Cancel pending batch work and block any further batch dispatch."""
+    try:
+        return _batch_response(TaskService(session).cancel_batch(batch_id))
+    except TaskError as exc:
+        _raise(exc)
 
 
 @router.get("", response_model=TaskListResponse)

@@ -18,13 +18,15 @@ Date: `2026-08-28`
 11. Implement Batch 3, Task 8: leases, fair scheduling, and worker recovery. (completed)
 12. Implement Batch 4, Task 9: normalized integration adapters. (completed)
 13. Implement Batch 4, Task 10: operations management UI. (completed)
-14. Implement Batch 5, Task 11: encrypted backup and restore. (pending)
-15. Implement Batch 5, Task 12: Railway deployment and end-to-end verification.
-    (pending)
+14. Implement Batch 4, Task 11: read-only Kredo Points and HSK balance sync.
+    (completed)
+15. Implement Batch 5, Task 12: encrypted backup and restore. (completed)
+16. Implement Batch 5, Task 13: Railway deployment and end-to-end verification.
+    (in progress)
 
 ## Active Slice
 
-Batch 2, Task 7: durable task state transitions and idempotency.
+Batch 5, Task 13: Railway deployment and end-to-end verification.
 
 ## Completed
 
@@ -72,6 +74,27 @@ Batch 2, Task 7: durable task state transitions and idempotency.
   wallet, binding, task, and Vault surfaces with manual row actions, batch
   controls, import flows, redacted secret handling, and responsive laptop,
   tablet, and mobile layouts.
+- Kredo account summary fields are normalized into a replaceable
+  binding-scoped snapshot: Points, available HSK, and open-position HSK value.
+- `balance_sync` is a read-only durable task with isolated account/wallet
+  leases; its failure state preserves the last successful numeric snapshot.
+- Binding and balance APIs expose the latest snapshot and allow selected or
+  all-bound records to be queued for a fresh sync.
+- The binding UI shows Points/HSK columns and supports single-row or selected
+  batch synchronization.
+- Encrypted backup packages contain the manager schema and vault metadata,
+  use an independent recovery-key envelope, verify checksums before restore,
+  and reject malformed or non-empty restore targets.
+- Vault HTTP routes expose backup download, backup verification, and restore;
+  the UI surfaces the result summary without exposing secret material.
+- Batch rows expose pause, resume, and cancel controls; the scheduler skips
+  non-active batches and workers cancel pending external polling cleanly.
+- Batch dispatch limits now cap active leases per batch, independent of global
+  worker capacity.
+- Failed or cancelled predecessors now move queued dependents to an explicit
+  `blocked` state; retrying the predecessor can requeue the blocked chain.
+- Cancellation is cooperative for running workers, immediate for leased work,
+  and preserves a redacted cancellation-request event.
 
 ## Evidence
 
@@ -80,25 +103,29 @@ Batch 2, Task 7: durable task state transitions and idempotency.
 
 ## Blockers
 
-None.
+None. Direct TCP access is unavailable from this workstation, but the local
+Clash HTTP proxy path is verified below.
 
 ## Resume State
 
 The user selected inline execution in the current workspace. Account import,
 Vault HTTP lifecycle wiring, wallet import/derivation, immutable binding,
 durable task state, leases, fair scheduling, worker recovery, normalized
-adapters, and the operations UI are complete.
-Existing uncommitted CLI, documentation, script, and test changes are user-owned
-and must remain untouched. The next slice is encrypted backup and restore.
+adapters, balance snapshots, balance sync tasks, the operations UI, encrypted
+backup/restore, batch lifecycle controls, dependency blocking, and cooperative
+cancellation are complete. Existing uncommitted CLI, documentation, script,
+and test changes are user-owned and must remain untouched. The remaining work
+is final diff review and shipping decisions.
 
 ## Drift Check
 
 - Intent: aligned.
 - Scope: account TSV preview/commit, Vault lifecycle wiring, wallet
   import/derivation, immutable bindings, durable task state, leases, fair
-  scheduling, worker recovery, normalized adapters, and the operations UI are
-  complete; encrypted backup/restore and live Railway verification remain out
-  of scope for this checkpoint.
+  scheduling, worker recovery, normalized adapters, balance snapshots, balance
+  sync tasks, the operations UI, encrypted backup/restore, and batch lifecycle
+  controls are complete; hosted deployment remains outside this local
+  checkpoint.
 - Compatibility: existing CLI and manager persistence models are explicit
   non-edits.
 - Retirement: unchanged.
@@ -106,7 +133,8 @@ and must remain untouched. The next slice is encrypted backup and restore.
   decisions; `manager_api.services.vault` remains the sole crypto owner;
   `VaultRuntime` owns process-local key lifetime; wallet source and derivation
   logic is owned by `manager_api.services.wallets`; pairing rules are owned by
-  `manager_api.services.bindings`; task state and event transitions are owned
+  `manager_api.services.bindings`; balance snapshot writes are owned by
+  `manager_api.services.balances`; task state and event transitions are owned
   by `manager_api.services.tasks`; lease acquisition and release are owned by
   `manager_api.repositories.leases`; dispatch and recovery are owned by
   `manager_api.scheduler`; one-job execution and queue acknowledgement are
@@ -117,10 +145,40 @@ and must remain untouched. The next slice is encrypted backup and restore.
   redacted preview, encrypted commit, API redaction, shared Vault runtime,
   wallet derivation, wallet duplicate classification, and wallet API
   redaction, binding immutability, binding conflicts, task state/event,
-  lease exclusivity, fair scheduling, queue delivery, and worker recovery
-  tests, normalized adapter fakes, and the frontend production build are
-  complete for the closed slices. Live PostgreSQL/Redis startup and browser
-  smoke coverage remain open.
-- Review gate: Vault encryption remains the only crypto owner. HTTP commit now
-  requires the shared Vault unlock dependency and is covered by runtime tests.
-- Decision: continue to Batch 5, Task 11.
+  lease exclusivity, fair scheduling, queue delivery, worker recovery, balance
+  snapshot, normalized adapters, encrypted backup/restore, batch lifecycle,
+  dependency blocking, and cooperative cancellation tests, plus the frontend
+  production build, are complete for the closed slices. Live PostgreSQL/Redis
+  startup and Alembic migration are verified through the local Clash tunnel;
+  hosted deployment and end-to-end provider actions remain open.
+- Review gate: Vault encryption remains the only crypto owner. HTTP commit,
+  backup, and restore use the shared Vault runtime and never return secret
+  material.
+- Decision: review the full diff, then ship when the user selects the landing
+  path.
+
+## Local Railway Runtime Evidence
+
+- Added a private, Git-excluded `.env.manager` with the supplied Railway
+  PostgreSQL and Redis connection values so the manager application, Alembic,
+  and runtime scripts share one local configuration source.
+- Added the requested private runtime record at
+  `docs/local-railway-runtime.md`; it is excluded through
+  `.git/info/exclude` and is not part of the repository change set.
+- `.env.manager` is mode `0600`.
+- DNS resolution succeeded for both Railway proxy hosts on 2026-08-28.
+- Direct TCP connection attempts to PostgreSQL port `34945` and Redis port
+  `35427` timed out on 2026-08-28. No direct migration or application write
+  reached Railway.
+- The normal test suite remains dependency-isolated by design. Real Railway
+  dependency checks use the private `.env.manager` smoke commands.
+- Added `scripts/manager_clash_tunnel.py` to expose the configured Railway
+  PostgreSQL and Redis endpoints through local Clash HTTP `CONNECT` tunnels.
+- Through the tunnel, PostgreSQL and Redis health checks passed and
+  `manager_migrate.py` completed at Alembic `head` on 2026-08-28.
+- A fresh tunnel probe on 2026-08-28 established PostgreSQL connectivity,
+  returned Redis `PING=True`, and completed without writing application data.
+- PostgreSQL-specific migration branches were added to revisions `0002`,
+  `0003`, and `0004`; SQLite keeps its existing table-rebuild path.
+- A fresh tunnel probe returned PostgreSQL `SELECT 1`, Redis `PING=True`, and
+  application readiness with both checks `ok` on 2026-08-28.

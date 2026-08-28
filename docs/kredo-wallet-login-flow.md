@@ -41,6 +41,36 @@ Observed logged-in markers:
 
 Kredo requested chain switch to `0xb1` during login. The login itself completed with message signing, not transaction submission.
 
+## Points and HSK Balance Query
+
+The logged-in task page reads the account summary from the Kredo API host:
+
+```text
+GET https://api.kredo.fun/api/v1/account/summary
+Authorization: Bearer <auth_token>
+```
+
+The useful response fields are:
+
+- `points`: account Points balance;
+- `cashHsk.available`: currently available HSK;
+- `portfolio.positionsValueHsk`: HSK value represented by open positions.
+
+The manager stores these as the latest binding-scoped snapshot in
+`manager_api.models.balances.KredoBalanceSnapshot`. The raw provider response
+is not persisted. The read-only manager routes are:
+
+```text
+GET  /api/balances
+GET  /api/balances/{binding_id}
+POST /api/balances/sync
+```
+
+`POST /api/balances/sync` creates isolated `balance_sync` jobs. The worker
+decrypts the account and wallet material for that one binding, calls the
+adapter's `account_summary` method, and writes the normalized values. It does
+not call bind, repost, or claim.
+
 ## Current Verification Record
 
 - Date: 2026-08-28

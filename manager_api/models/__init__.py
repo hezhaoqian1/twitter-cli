@@ -2,6 +2,7 @@
 
 from .accounts import AccountSecret, SocialAccount
 from .audit import AuditLog
+from .balances import KredoBalanceSnapshot
 from .bindings import AccountWalletBinding
 from .imports import ImportBatch, ImportRow
 from .tasks import ResourceLease, TaskBatch, TaskEvent, TaskJob
@@ -12,6 +13,7 @@ __all__ = [
     "AccountSecret",
     "AccountWalletBinding",
     "AuditLog",
+    "KredoBalanceSnapshot",
     "ImportBatch",
     "ImportRow",
     "ResourceLease",

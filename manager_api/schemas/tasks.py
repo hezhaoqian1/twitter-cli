@@ -11,7 +11,7 @@ from ..models.tasks import TaskKind, TaskState
 
 
 class TaskCreateRequest(BaseModel):
-    """Create one durable manual task without persisting the raw target."""
+    """Create one durable manual task with a restart-safe public target."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -44,6 +44,27 @@ class TaskBatchCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     kind: TaskKind
     items: list[TaskBatchItemRequest] = Field(min_length=1, max_length=500)
+    dispatch_limit: int = Field(default=10, ge=1, le=32)
+
+
+class WorkflowBatchItemRequest(BaseModel):
+    """One account-wallet pair in the login, binding, repost, and claim workflow."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    social_account_id: UUID
+    wallet_id: UUID
+    repost_target: str = Field(min_length=1, max_length=512)
+    priority: int = Field(default=0, ge=-100, le=100)
+
+
+class WorkflowBatchCreateRequest(BaseModel):
+    """Create verify, bind, repost, and claim jobs for each independent pair."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=255)
+    items: list[WorkflowBatchItemRequest] = Field(min_length=1, max_length=500)
     dispatch_limit: int = Field(default=10, ge=1, le=32)
 
 
@@ -87,6 +108,7 @@ class TaskResponse(BaseModel):
     social_account_id: UUID | None = None
     wallet_id: UUID | None = None
     binding_id: UUID | None = None
+    depends_on_task_id: UUID | None = None
     idempotency_key: str
     lease_keys: list[str]
     scheduled_at: datetime
@@ -120,6 +142,7 @@ class TaskBatchResponse(BaseModel):
     id: UUID
     name: str
     kind: TaskKind
+    workflow_type: str
     state: str
     dispatch_limit: int
     created_at: datetime

@@ -12,6 +12,7 @@ from .protocol import (
     ExternalOperation,
     ExternalPayload,
     ExternalStatus,
+    KredoBalanceResult,
     KredoWorkflowFactory,
     OperationMaterial,
     WalletMaterial,
@@ -113,6 +114,28 @@ class KredoAdapter:
             raise
         except Exception as error:
             raise AdapterError.from_exception("status", error, retryable=True) from error
+
+    def account_summary(
+        self,
+        account: AccountMaterial,
+        wallet: WalletMaterial,
+        operation: OperationMaterial,
+    ) -> KredoBalanceResult:
+        """Read the provider account summary and keep only normalized balances."""
+        try:
+            with self._workflow_factory(operation) as workflow:
+                payload = workflow.account_summary(account, wallet, operation)
+                return self._normalize_balance(payload)
+        except AdapterError:
+            raise
+        except (TypeError, ValueError) as error:
+            raise AdapterError(
+                "balance_invalid_response",
+                "external provider returned invalid balance fields",
+                retryable=False,
+            ) from error
+        except Exception as error:
+            raise AdapterError.from_exception("balance", error, retryable=True) from error
 
     def _run_action(
         self,
@@ -258,3 +281,49 @@ class KredoAdapter:
             attributes=attributes,
         )
         return status, operation_ref, evidence
+
+    @staticmethod
+    def _normalize_balance(payload: ExternalPayload) -> KredoBalanceResult:
+        """Extract points and HSK values from Kredo's account summary envelope."""
+        if not isinstance(payload, Mapping):
+            raise ValueError("balance payload must be an object")
+        data = payload.get("data")
+        if isinstance(data, Mapping):
+            payload = data
+        summary = payload.get("summary")
+        if isinstance(summary, Mapping):
+            payload = summary
+        cash_hsk = payload.get("cashHsk", payload.get("cash_hsk", {}))
+        portfolio = payload.get("portfolio", {})
+        if not isinstance(cash_hsk, Mapping):
+            cash_hsk = {}
+        if not isinstance(portfolio, Mapping):
+            portfolio = {}
+        points = payload.get("points")
+        cash_available = cash_hsk.get("available", payload.get("cashHskAvailable"))
+        positions_value = portfolio.get(
+            "positionsValueHsk",
+            payload.get("positionsValueHsk"),
+        )
+        if points is None or cash_available is None or positions_value is None:
+            raise ValueError("balance payload is missing required fields")
+        from .protocol import AdapterEvidence, decimal_value
+
+        return KredoBalanceResult(
+            points=decimal_value(points, field_name="points"),
+            cash_hsk_available=decimal_value(
+                cash_available,
+                field_name="cashHsk.available",
+            ),
+            positions_value_hsk=decimal_value(
+                positions_value,
+                field_name="portfolio.positionsValueHsk",
+            ),
+            evidence=AdapterEvidence(
+                code="balance_synced",
+                summary="Kredo account summary synchronized",
+                attributes={
+                    "fields": ["points", "cashHsk.available", "portfolio.positionsValueHsk"],
+                },
+            ),
+        )

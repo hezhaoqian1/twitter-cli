@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
@@ -68,7 +68,7 @@ class TaskService:
     _TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
         TaskState.DRAFT: frozenset({TaskState.QUEUED, TaskState.CANCELLED}),
         TaskState.QUEUED: frozenset(
-            {TaskState.LEASED, TaskState.PAUSED, TaskState.CANCELLED}
+            {TaskState.LEASED, TaskState.PAUSED, TaskState.BLOCKED, TaskState.CANCELLED}
         ),
         TaskState.LEASED: frozenset({TaskState.RUNNING, TaskState.QUEUED, TaskState.CANCELLED}),
         TaskState.RUNNING: frozenset(
@@ -76,12 +76,14 @@ class TaskService:
                 TaskState.WAITING_EXTERNAL_VALIDATION,
                 TaskState.SUCCEEDED,
                 TaskState.FAILED,
+                TaskState.CANCELLED,
             }
         ),
         TaskState.WAITING_EXTERNAL_VALIDATION: frozenset(
-            {TaskState.QUEUED, TaskState.SUCCEEDED, TaskState.FAILED}
+            {TaskState.QUEUED, TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED}
         ),
         TaskState.FAILED: frozenset({TaskState.QUEUED}),
+        TaskState.BLOCKED: frozenset({TaskState.QUEUED}),
         TaskState.PAUSED: frozenset({TaskState.QUEUED, TaskState.CANCELLED}),
         TaskState.SUCCEEDED: frozenset(),
         TaskState.CANCELLED: frozenset(),
@@ -101,6 +103,8 @@ class TaskService:
         priority: int = 0,
         scheduled_at: datetime | None = None,
         task_batch_id: UUID | None = None,
+        depends_on_task_id: UUID | None = None,
+        allow_pending_binding: bool = False,
     ) -> TaskCreateResult:
         """Create a queued task or return the existing job for its idempotency key."""
         target = external_target.strip()
@@ -111,7 +115,17 @@ class TaskService:
             social_account_id=social_account_id,
             wallet_id=wallet_id,
             binding_id=binding_id,
+            allow_pending_binding=allow_pending_binding,
         )
+        if depends_on_task_id is not None:
+            dependency = self.session.get(TaskJob, depends_on_task_id)
+            if dependency is None:
+                raise TaskConflictError("dependency_not_found", "task dependency not found")
+            if dependency.state in {
+                TaskState.CANCELLED,
+                TaskState.FAILED,
+            }:
+                raise TaskConflictError("dependency_terminal_failure", "task dependency already failed")
         scope = self._scope_key(
             binding_id=binding_id,
             social_account_id=resolved_account,
@@ -136,6 +150,8 @@ class TaskService:
             social_account_id=resolved_account,
             wallet_id=resolved_wallet,
             binding_id=binding_id,
+            depends_on_task_id=depends_on_task_id,
+            external_target=target,
             idempotency_key=idempotency_key,
             lease_keys=lease_keys,
             scheduled_at=scheduled_at or utc_now(),
@@ -213,6 +229,57 @@ class TaskService:
             raise TaskNotFoundError("task not found")
         return job
 
+    def get_batch(self, batch_id: UUID) -> TaskBatch:
+        """Load one batch with all of its redacted child task state."""
+        batch = self.session.execute(
+            select(TaskBatch)
+            .where(TaskBatch.id == batch_id)
+            .options(joinedload(TaskBatch.jobs).joinedload(TaskJob.events))
+        ).unique().scalar_one_or_none()
+        if batch is None:
+            raise TaskNotFoundError("task batch not found")
+        return batch
+
+    def pause_batch(self, batch_id: UUID) -> TaskBatch:
+        """Stop future dispatch for a batch and pause every still-queued child."""
+        batch = self.get_batch(batch_id)
+        if batch.state != "active":
+            raise TaskConflictError("batch_not_active", "only active batches can be paused")
+        batch.state = "paused"
+        batch.paused_at = utc_now()
+        for job in batch.jobs:
+            if job.state is TaskState.QUEUED:
+                self.transition(job.id, TaskState.PAUSED, summary="batch paused")
+        self.session.flush()
+        return batch
+
+    def resume_batch(self, batch_id: UUID) -> TaskBatch:
+        """Return a paused batch to dispatch and requeue its paused children."""
+        batch = self.get_batch(batch_id)
+        if batch.state != "paused":
+            raise TaskConflictError("batch_not_paused", "only paused batches can be resumed")
+        batch.state = "active"
+        batch.paused_at = None
+        for job in batch.jobs:
+            if job.state is TaskState.PAUSED:
+                self.transition(job.id, TaskState.QUEUED, summary="batch resumed")
+        self.session.flush()
+        return batch
+
+    def cancel_batch(self, batch_id: UUID) -> TaskBatch:
+        """Cancel pending work and request cancellation for active workers."""
+        batch = self.get_batch(batch_id)
+        if batch.state == "cancelled":
+            return batch
+        if batch.state not in {"active", "paused"}:
+            raise TaskConflictError("batch_not_cancellable", "batch cannot be cancelled")
+        batch.state = "cancelled"
+        batch.paused_at = utc_now()
+        for job in batch.jobs:
+            self.request_cancel(job.id, summary="batch cancelled")
+        self.session.flush()
+        return batch
+
     def list_jobs(self, *, offset: int = 0, limit: int = 50) -> tuple[list[TaskJob], int]:
         """Return task rows in creation order with redacted event history."""
         jobs = self.session.scalars(
@@ -275,8 +342,81 @@ class TaskService:
         return self.transition(task_id, TaskState.PAUSED, summary="task paused")
 
     def cancel(self, task_id: UUID) -> TaskJob:
-        """Cancel a queued, leased, or paused task before execution starts."""
-        return self.transition(task_id, TaskState.CANCELLED, summary="task cancelled")
+        """Cancel pending work or request cancellation for an active worker."""
+        return self.request_cancel(task_id, summary="task cancelled")
+
+    def request_cancel(self, task_id: UUID, *, summary: str) -> TaskJob:
+        """Cancel pending work and mark running work for cooperative cancellation."""
+        job = self.get(task_id)
+        if job.state in {
+            TaskState.SUCCEEDED,
+            TaskState.FAILED,
+            TaskState.BLOCKED,
+            TaskState.CANCELLED,
+        }:
+            return job
+        if job.state is TaskState.RUNNING:
+            if job.cancel_requested_at is None:
+                job.cancel_requested_at = utc_now()
+                self.session.flush()
+                self._append_event(
+                    job,
+                    event_type="cancel_requested",
+                    from_state=job.state,
+                    to_state=None,
+                    summary=summary,
+                )
+                self.session.flush()
+            return job
+        if job.state is TaskState.LEASED:
+            self.session.execute(delete(ResourceLease).where(ResourceLease.task_job_id == job.id))
+            self.session.flush()
+        return self.transition(job.id, TaskState.CANCELLED, summary=summary)
+
+    def refresh_dependency_states(self) -> int:
+        """Block queued dependents after failure and requeue them after recovery."""
+        changed = 0
+        while True:
+            round_changed = 0
+            jobs = self.session.scalars(
+                select(TaskJob)
+                .where(
+                    TaskJob.state.in_(
+                        (TaskState.QUEUED, TaskState.BLOCKED)
+                    ),
+                    TaskJob.depends_on_task_id.is_not(None),
+                )
+                .order_by(TaskJob.created_at, TaskJob.id)
+            ).all()
+            for job in jobs:
+                dependency = self.session.get(TaskJob, job.depends_on_task_id)
+                if dependency is None:
+                    continue
+                if dependency.state in {
+                    TaskState.FAILED,
+                    TaskState.BLOCKED,
+                    TaskState.CANCELLED,
+                } and job.state is TaskState.QUEUED:
+                    self.transition(
+                        job.id,
+                        TaskState.BLOCKED,
+                        summary="blocked by failed dependency",
+                        failure_code="dependency_failed",
+                    )
+                    round_changed += 1
+                elif dependency.state is TaskState.SUCCEEDED and job.state is TaskState.BLOCKED:
+                    job.failure_code = None
+                    job.finished_at = None
+                    self.session.flush()
+                    self.transition(
+                        job.id,
+                        TaskState.QUEUED,
+                        summary="dependency recovered; task requeued",
+                    )
+                    round_changed += 1
+            changed += round_changed
+            if round_changed == 0:
+                return changed
 
     def retry(self, task_id: UUID) -> TaskJob:
         """Requeue one failed task while preserving its idempotency boundary."""
@@ -336,15 +476,20 @@ class TaskService:
         social_account_id: UUID | None,
         wallet_id: UUID | None,
         binding_id: UUID | None,
+        allow_pending_binding: bool = False,
     ) -> tuple[UUID | None, UUID | None]:
         """Normalize task resource IDs and validate binding ownership."""
-        if kind in {TaskKind.REPOST, TaskKind.CLAIM}:
+        if kind in {TaskKind.REPOST, TaskKind.CLAIM, TaskKind.BALANCE_SYNC}:
             if binding_id is None:
-                raise TaskError("repost and claim tasks require binding_id")
+                raise TaskError("repost, claim, and balance sync tasks require binding_id")
             binding = self.session.get(AccountWalletBinding, binding_id)
             if binding is None:
                 raise TaskConflictError("binding_not_found", "binding not found")
-            if binding.state is not BindingState.BOUND:
+            if kind is TaskKind.BALANCE_SYNC and binding.state is not BindingState.BOUND:
+                raise TaskConflictError("binding_not_confirmed", "binding is not confirmed")
+            if kind is not TaskKind.BALANCE_SYNC and binding.state is not BindingState.BOUND and not (
+                allow_pending_binding and binding.state is BindingState.PENDING
+            ):
                 raise TaskConflictError("binding_not_confirmed", "binding is not confirmed")
             if (
                 social_account_id is not None

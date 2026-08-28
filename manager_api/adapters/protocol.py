@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, ContextManager, Protocol, TypeAlias
 
@@ -63,6 +64,19 @@ def redact_value(value: object, *, key: str | None = None) -> object:
     if isinstance(value, (list, tuple)):
         return [redact_value(item) for item in value]
     return value
+
+
+def decimal_value(value: object, *, field_name: str) -> Decimal:
+    """Normalize provider numbers without introducing binary floating-point drift."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{field_name} must be numeric")
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError) as error:
+        raise ValueError(f"{field_name} must be numeric") from error
+    if not result.is_finite():
+        raise ValueError(f"{field_name} must be finite")
+    return result
 
 
 @dataclass(frozen=True, repr=False)
@@ -215,6 +229,16 @@ class AccountHealthResult:
     evidence: AdapterEvidence
 
 
+@dataclass(frozen=True)
+class KredoBalanceResult:
+    """Normalized read-only Kredo points and HSK balances."""
+
+    points: Decimal
+    cash_hsk_available: Decimal
+    positions_value_hsk: Decimal
+    evidence: AdapterEvidence
+
+
 class AdapterError(RuntimeError):
     """Typed adapter failure whose message and evidence are safe for task events."""
 
@@ -298,6 +322,14 @@ class KredoWorkflowProtocol(Protocol):
 
     def status(self, operation: OperationMaterial) -> ExternalPayload:
         """Read the current external state before replaying an action."""
+
+    def account_summary(
+        self,
+        account: AccountMaterial,
+        wallet: WalletMaterial,
+        operation: OperationMaterial,
+    ) -> ExternalPayload:
+        """Read the current points and HSK summary without mutating provider state."""
 
 
 KredoWorkflowFactory: TypeAlias = Callable[

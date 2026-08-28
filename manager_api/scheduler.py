@@ -8,10 +8,10 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import delete, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from .db.base import utc_now
-from .models.tasks import ResourceLease, TaskJob, TaskState
+from .models.tasks import ResourceLease, TaskBatch, TaskJob, TaskState
 from .repositories.leases import LeaseGrant, LeaseRepository
 from .services.tasks import TaskService
 
@@ -53,6 +53,7 @@ class Scheduler:
         if requested_limit < 1:
             return []
         current_time = now or utc_now()
+        TaskService(self.session).refresh_dependency_states()
         active_leases = self.session.scalar(
             select(func.count(func.distinct(ResourceLease.task_job_id))).where(
                 ResourceLease.expires_at > current_time
@@ -105,9 +106,30 @@ class Scheduler:
         if not isinstance(queue, TaskQueue):
             raise TypeError("queue must implement TaskQueue")
         grants = self.dispatch_once(limit=limit)
+        enqueued: list[DispatchGrant] = []
         for grant in grants:
-            queue.enqueue(grant)
-        return grants
+            try:
+                queue.enqueue(grant)
+            except Exception:
+                # 队列写入失败时立即归还租约，避免数据库出现“已派发但永远没人消费”的任务。
+                try:
+                    with self.session.begin_nested():
+                        LeaseRepository(self.session).release(
+                            grant.owner_token,
+                            task_job_id=grant.task_job_id,
+                            lease_keys=grant.lease_keys,
+                        )
+                        TaskService(self.session).transition(
+                            grant.task_job_id,
+                            TaskState.QUEUED,
+                            summary="queue enqueue failed; task returned to queue",
+                        )
+                except Exception:
+                    # 恢复动作本身失败时交给过期租约扫描兜底。
+                    continue
+                continue
+            enqueued.append(grant)
+        return enqueued
 
     def recover_expired(self, *, now: datetime | None = None) -> list[UUID]:
         """Requeue leased/running jobs whose worker lease has expired."""
@@ -140,18 +162,27 @@ class Scheduler:
 
     def _fair_candidates(self, *, limit: int, now: datetime) -> list[TaskJob]:
         """Round-robin the oldest eligible job from each batch."""
+        dependency = aliased(TaskJob)
         jobs = self.session.scalars(
             select(TaskJob)
+            .outerjoin(dependency, TaskJob.depends_on_task_id == dependency.id)
+            .outerjoin(TaskBatch, TaskJob.task_batch_id == TaskBatch.id)
             .where(
                 TaskJob.state == TaskState.QUEUED,
                 TaskJob.scheduled_at <= now,
                 or_(TaskJob.next_poll_at.is_(None), TaskJob.next_poll_at <= now),
+                or_(TaskJob.task_batch_id.is_(None), TaskBatch.state == "active"),
+                or_(
+                    TaskJob.depends_on_task_id.is_(None),
+                    dependency.state == TaskState.SUCCEEDED,
+                ),
             )
             .order_by(TaskJob.scheduled_at, TaskJob.created_at, TaskJob.id)
         ).all()
 
         groups: dict[str, deque[TaskJob]] = {}
         order: list[str] = []
+        batch_ids: set[UUID] = set()
         for job in jobs:
             group_key = (
                 f"batch:{job.task_batch_id}"
@@ -162,14 +193,51 @@ class Scheduler:
                 groups[group_key] = deque()
                 order.append(group_key)
             groups[group_key].append(job)
+            if job.task_batch_id is not None:
+                batch_ids.add(job.task_batch_id)
+
+        active_by_batch: dict[UUID, int] = {}
+        if batch_ids:
+            active_by_batch = {
+                batch_id: int(active_count)
+                for batch_id, active_count in self.session.execute(
+                    select(
+                        TaskJob.task_batch_id,
+                        func.count(func.distinct(ResourceLease.task_job_id)),
+                    )
+                    .join(ResourceLease, ResourceLease.task_job_id == TaskJob.id)
+                    .where(
+                        TaskJob.task_batch_id.in_(batch_ids),
+                        ResourceLease.expires_at > now,
+                    )
+                    .group_by(TaskJob.task_batch_id)
+                ).all()
+                if batch_id is not None
+            }
+        batch_limits = {
+            batch.id: batch.dispatch_limit
+            for batch in self.session.scalars(
+                select(TaskBatch).where(TaskBatch.id.in_(batch_ids))
+            ).all()
+        } if batch_ids else {}
 
         selected: list[TaskJob] = []
         while order and len(selected) < limit:
             next_order: list[str] = []
             for group_key in order:
                 queue = groups[group_key]
+                batch_id = queue[0].task_batch_id if queue else None
+                if (
+                    batch_id is not None
+                    and active_by_batch.get(batch_id, 0)
+                    >= batch_limits.get(batch_id, 0)
+                ):
+                    continue
                 if queue:
-                    selected.append(queue.popleft())
+                    selected_job = queue.popleft()
+                    selected.append(selected_job)
+                    if batch_id is not None:
+                        active_by_batch[batch_id] = active_by_batch.get(batch_id, 0) + 1
                 if queue:
                     next_order.append(group_key)
                 if len(selected) >= limit:

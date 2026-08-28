@@ -81,6 +81,23 @@ def test_worker_exception_is_redacted_and_marks_failure(session: Session) -> Non
     assert session.query(ResourceLease).count() == 0
 
 
+def test_running_worker_honors_cancellation_request(session: Session) -> None:
+    """A cancellation raised while the handler is active wins over its outcome."""
+    _queued(session, "cancel")
+    scheduler = Scheduler(session, lease_ttl_seconds=60)
+    grant = scheduler.dispatch_once(limit=1)[0]
+
+    def cancelling_handler(current_job):
+        TaskService(session).cancel(current_job.id)
+        return WorkerOutcome(state=TaskState.SUCCEEDED, summary="late success")
+
+    result = TaskWorker(session, scheduler=scheduler).run_one(grant, cancelling_handler)
+
+    assert result.state is TaskState.CANCELLED
+    assert result.cancel_requested_at is not None
+    assert result.events[-1].to_state == TaskState.CANCELLED.value
+
+
 def test_recovery_requeues_expired_running_job_and_records_event(session: Session) -> None:
     job = _queued(session, "9")
     scheduler = Scheduler(session, lease_ttl_seconds=60)

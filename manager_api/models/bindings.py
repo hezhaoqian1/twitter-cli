@@ -11,10 +11,12 @@ from sqlalchemy import DateTime, ForeignKey, Index, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ..db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+from . import balances as _balances  # noqa: F401
 from .enums import StringEnum
 
 if TYPE_CHECKING:
     from .accounts import SocialAccount
+    from .balances import KredoBalanceSnapshot
     from .wallets import Wallet
 
 
@@ -68,3 +70,8 @@ class AccountWalletBinding(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     account: Mapped["SocialAccount"] = relationship(back_populates="bindings")
     wallet: Mapped["Wallet"] = relationship(back_populates="bindings")
+    balance_snapshot: Mapped["KredoBalanceSnapshot | None"] = relationship(
+        back_populates="binding",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )

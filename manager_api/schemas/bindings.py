@@ -7,6 +7,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .balances import BalanceResponse
+
 
 class BindingCreateRequest(BaseModel):
     """Request one immutable account-wallet pairing intent."""
@@ -41,6 +43,7 @@ class BindingResponse(BaseModel):
     bound_at: datetime | None = None
     external_reference: str | None = None
     archived_at: datetime | None = None
+    balance: BalanceResponse | None = None
 
 
 class BindingListResponse(BaseModel):

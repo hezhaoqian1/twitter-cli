@@ -91,6 +91,7 @@ def test_archived_resource_and_active_lease_have_distinct_conflicts(session: Ses
         idempotency_key="bind:lease-fixture",
         lease_keys=[],
         scheduled_at=utc_now(),
+        external_target="kredo:bind",
     )
     session.add(job)
     session.flush()
@@ -124,6 +125,7 @@ def test_binding_api_is_registered_and_list_is_redacted(session: Session) -> Non
         )
     )
     assert "/api/bindings" in app.openapi()["paths"]
+    assert "/api/balances" in app.openapi()["paths"]
     created = create_binding(
         BindingCreateRequest(social_account_id=account.id, wallet_id=wallet.id),
         session=session,

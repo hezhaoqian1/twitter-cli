@@ -20,6 +20,7 @@ import {
   RotateCcw,
   Send,
   ShieldCheck,
+  Upload,
   WalletCards,
   X
 } from "lucide-react";
@@ -39,6 +40,7 @@ import {
   ApiError,
   Task,
   TaskBatch,
+  VaultBackupSummary,
   VaultStatus,
   WalletPreview
 } from "./api/client";
@@ -101,8 +103,13 @@ function dateTime(value: string | null) {
     : "—";
 }
 
+function amount(value: number | string | null | undefined) {
+  if (value === null || value === undefined) return "—";
+  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 4 }).format(Number(value));
+}
+
 function stateTone(state: string) {
-  if (["succeeded", "bound", "healthy", "active"].includes(state)) return "success";
+  if (["succeeded", "bound", "healthy", "active", "valid"].includes(state)) return "success";
   if (["failed", "invalid", "archived", "cancelled"].includes(state)) return "danger";
   if (["waiting_external_validation", "running", "leased", "pending", "queued"].includes(state)) {
     return "warning";
@@ -462,6 +469,8 @@ function AccountsPage({
   const bindings = useResource(api.bindings, refresh);
   const [importOpen, setImportOpen] = useState(false);
   const [bindingAccount, setBindingAccount] = useState<Account | null>(null);
+  const [workflowOpen, setWorkflowOpen] = useState(false);
+  const [verifyingAccountId, setVerifyingAccountId] = useState<string | null>(null);
   const occupiedAccountIds = useMemo(
     () =>
       new Set(
@@ -471,16 +480,37 @@ function AccountsPage({
       ),
     [bindings.value]
   );
+  const verifyAccount = async (account: Account) => {
+    setVerifyingAccountId(account.id);
+    try {
+      await api.createTask({
+        kind: "verify_account",
+        social_account_id: account.id,
+        external_target: "x:verify"
+      });
+      onComplete(`已加入 @${account.handle} 的会话校验`);
+    } catch (error) {
+      onNotice(toMessage(error), "error");
+    } finally {
+      setVerifyingAccountId(null);
+    }
+  };
 
   return (
     <div className="page-stack">
       <PageToolbar
         description="导入的 X 账号仅以掩码身份和会话状态显示。"
         action={
-          <Button tone="primary" onClick={() => setImportOpen(true)} disabled={!vault?.unlocked}>
-            <Plus size={17} />
-            导入账号
-          </Button>
+          <div className="toolbar-actions">
+            <Button onClick={() => setWorkflowOpen(true)} disabled={!vault?.unlocked}>
+              <Layers3 size={16} />
+              批量绑定并转发
+            </Button>
+            <Button tone="primary" onClick={() => setImportOpen(true)} disabled={!vault?.unlocked}>
+              <Plus size={17} />
+              导入账号
+            </Button>
+          </div>
         }
       />
       <Panel>
@@ -517,12 +547,34 @@ function AccountsPage({
                             binding.social_account_id === account.id && binding.state !== "archived"
                         )?.state;
                         return (
-                      <Button
-                        onClick={() => setBindingAccount(account)}
-                        disabled={account.state !== "active" || !vault?.unlocked || occupied}
-                      >
-                        {bindingLabel === "bound" ? "已绑定" : bindingLabel === "pending" ? "绑定中" : "绑定"}
-                      </Button>
+                          <>
+                            <Button
+                              onClick={() => void verifyAccount(account)}
+                              disabled={
+                                account.state !== "active" ||
+                                !vault?.unlocked ||
+                                verifyingAccountId === account.id
+                              }
+                            >
+                              {verifyingAccountId === account.id ? (
+                                <LoaderCircle className="spin" size={15} />
+                              ) : (
+                                <ShieldCheck size={15} />
+                              )}
+                              校验会话
+                            </Button>
+                            <Button
+                              onClick={() => setBindingAccount(account)}
+                              disabled={account.state !== "active" || !vault?.unlocked || occupied}
+                            >
+                              <Link2 size={15} />
+                              {bindingLabel === "bound"
+                                ? "已绑定"
+                                : bindingLabel === "pending"
+                                  ? "绑定中"
+                                  : "绑定"}
+                            </Button>
+                          </>
                         );
                       })()}
                     </td>
@@ -553,6 +605,18 @@ function AccountsPage({
           onClose={() => setBindingAccount(null)}
           onComplete={(message) => {
             setBindingAccount(null);
+            onComplete(message);
+          }}
+          onNotice={onNotice}
+        />
+      )}
+      {workflowOpen && (
+        <WorkflowDialog
+          accounts={accounts.value?.items ?? []}
+          refresh={refresh}
+          onClose={() => setWorkflowOpen(false)}
+          onComplete={(message) => {
+            setWorkflowOpen(false);
             onComplete(message);
           }}
           onNotice={onNotice}
@@ -651,6 +715,7 @@ function BindingsPage({
   const bindings = useResource(api.bindings, refresh);
   const [selected, setSelected] = useState<string[]>([]);
   const [operation, setOperation] = useState<{ kind: "repost" | "claim"; bindingIds: string[] } | null>(null);
+  const [syncing, setSyncing] = useState(false);
   const visibleBound = useMemo(
     () => bindings.value?.items.filter((binding) => binding.state === "bound") ?? [],
     [bindings.value]
@@ -662,6 +727,18 @@ function BindingsPage({
 
   const toggle = (id: string) => {
     setSelected((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+  };
+
+  const syncBalances = async (bindingIds?: string[]) => {
+    setSyncing(true);
+    try {
+      const result = await api.syncBalances(bindingIds);
+      onComplete(`已排队 ${result.queued} 条余额同步任务`);
+    } catch (error) {
+      onNotice(toMessage(error), "error");
+    } finally {
+      setSyncing(false);
+    }
   };
 
   return (
@@ -684,6 +761,13 @@ function BindingsPage({
             >
               <Play size={16} />
               批量领取 ({selected.length})
+            </Button>
+            <Button
+              onClick={() => void syncBalances(selected)}
+              disabled={!vault?.unlocked || selected.length === 0 || syncing}
+            >
+              {syncing ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
+              同步余额 ({selected.length})
             </Button>
           </div>
         }
@@ -712,6 +796,10 @@ function BindingsPage({
                   <th>地址</th>
                   <th>绑定状态</th>
                   <th>确认时间</th>
+                  <th>Points</th>
+                  <th>HSK</th>
+                  <th>持仓 HSK</th>
+                  <th>余额同步</th>
                   <th className="actions-column">操作</th>
                 </tr>
               </thead>
@@ -733,7 +821,26 @@ function BindingsPage({
                       <td className="mono">{compact(binding.wallet_address, 12, 8)}</td>
                       <td><StateChip value={binding.state} /></td>
                       <td>{dateTime(binding.bound_at)}</td>
+                      <td className="mono">{amount(binding.balance?.points)}</td>
+                      <td className="mono">{amount(binding.balance?.cash_hsk_available)}</td>
+                      <td className="mono">{amount(binding.balance?.positions_value_hsk)}</td>
+                      <td>
+                        <span className={`sync-state sync-${binding.balance?.sync_status ?? "never"}`}>
+                          {binding.balance?.sync_status === "success"
+                            ? dateTime(binding.balance.last_synced_at)
+                            : binding.balance?.sync_status === "error"
+                              ? "失败"
+                              : "未同步"}
+                        </span>
+                      </td>
                       <td className="row-actions">
+                        <Button
+                          disabled={!eligible || !vault?.unlocked || syncing}
+                          onClick={() => void syncBalances([binding.id])}
+                        >
+                          <RefreshCw size={14} />
+                          同步
+                        </Button>
                         <Button
                           disabled={!eligible || !vault?.unlocked}
                           onClick={() => setOperation({ kind: "repost", bindingIds: [binding.id] })}
@@ -796,6 +903,20 @@ function TasksPage({
       onNotice(toMessage(error), "error");
     }
   };
+  const batchCommand = async (batch: TaskBatch, action: "pause" | "resume" | "cancel") => {
+    try {
+      await api.batchCommand(batch.id, action);
+      onComplete(
+        action === "resume"
+          ? `批次“${batch.name}”已恢复`
+          : action === "pause"
+            ? `批次“${batch.name}”已暂停`
+            : `批次“${batch.name}”已取消`
+      );
+    } catch (error) {
+      onNotice(toMessage(error), "error");
+    }
+  };
 
   return (
     <div className="page-stack">
@@ -848,7 +969,7 @@ function TasksPage({
         <Panel title="最近批次">
           <div className="batch-list">
             {batches.value.items.slice(0, 5).map((batch) => (
-              <BatchRow key={batch.id} batch={batch} />
+              <BatchRow key={batch.id} batch={batch} onCommand={batchCommand} />
             ))}
           </div>
         </Panel>
@@ -939,22 +1060,55 @@ function TaskDetail({
   );
 }
 
-function BatchRow({ batch }: { batch: TaskBatch }) {
+function BatchRow({
+  batch,
+  onCommand
+}: {
+  batch: TaskBatch;
+  onCommand: (batch: TaskBatch, action: "pause" | "resume" | "cancel") => void;
+}) {
   const states = batch.jobs.reduce<Record<string, number>>((counts, task) => {
     counts[task.state] = (counts[task.state] ?? 0) + 1;
     return counts;
   }, {});
+  const completed = batch.jobs.filter((task) =>
+    ["succeeded", "failed", "cancelled"].includes(task.state)
+  ).length;
+  const failed = states.failed ?? 0;
+  const completion = batch.jobs.length ? Math.round((completed / batch.jobs.length) * 100) : 0;
   return (
     <div className="batch-row">
       <div className="batch-icon"><Layers3 size={17} /></div>
       <div>
         <strong>{batch.name}</strong>
-        <span>{batch.kind} · dispatch {batch.dispatch_limit}</span>
+        <span>{batch.workflow_type === "account_wallet" ? "账号-地址工作流" : batch.kind} · dispatch {batch.dispatch_limit}</span>
+        <div className="batch-progress" aria-label={`${batch.name} 完成 ${completion}%`}>
+          <span><i style={{ width: `${completion}%` }} /></span>
+          <small>{completed}/{batch.jobs.length} · {completion}%{failed ? ` · ${failed} failed` : ""}</small>
+        </div>
       </div>
       <div className="batch-states">
+        <StateChip value={batch.state} />
         {Object.entries(states).map(([state, count]) => (
           <span key={state}><StateChip value={state} /> {count}</span>
         ))}
+      </div>
+      <div className="batch-actions">
+        {batch.state === "active" && (
+          <IconButton label="暂停批次" onClick={() => onCommand(batch, "pause")}>
+            <Clock3 size={15} />
+          </IconButton>
+        )}
+        {batch.state === "paused" && (
+          <IconButton label="恢复批次" tone="primary" onClick={() => onCommand(batch, "resume")}>
+            <Play size={15} />
+          </IconButton>
+        )}
+        {["active", "paused"].includes(batch.state) && (
+          <IconButton label="取消批次" tone="danger" onClick={() => onCommand(batch, "cancel")}>
+            <X size={15} />
+          </IconButton>
+        )}
       </div>
       <time>{dateTime(batch.created_at)}</time>
     </div>
@@ -973,7 +1127,9 @@ function VaultPage({
   onNotice: (message: string, tone?: "success" | "error") => void;
 }) {
   const [mode, setMode] = useState<"initialize" | "unlock" | null>(null);
+  const [backupMode, setBackupMode] = useState<"create" | "verify" | "restore" | null>(null);
   const [recoveryKey, setRecoveryKey] = useState<string | null>(null);
+  const [backupResult, setBackupResult] = useState<(VaultBackupSummary & { restored?: boolean }) | null>(null);
   const vault = useResource(api.vaultStatus, refresh);
   const active = status || vault.value;
 
@@ -1032,8 +1188,22 @@ function VaultPage({
           <div className="vault-note">
             <Download size={18} />
             <div>
-              <strong>下一切片接入</strong>
-              <p>备份与恢复验证将在 Vault 导出路径完成后开放。</p>
+              <strong>加密备份包</strong>
+              <p>用恢复密钥生成可迁移的加密包，支持下载、校验和空库恢复。</p>
+            </div>
+            <div className="vault-backup-actions">
+              <Button onClick={() => setBackupMode("create")} disabled={!active?.initialized}>
+                <Download size={16} />
+                导出
+              </Button>
+              <Button onClick={() => setBackupMode("verify")} disabled={!active?.initialized}>
+                <ShieldCheck size={16} />
+                校验
+              </Button>
+              <Button onClick={() => setBackupMode("restore")} disabled={!active?.initialized}>
+                <Upload size={16} />
+                恢复
+              </Button>
             </div>
           </div>
         </Panel>
@@ -1071,7 +1241,135 @@ function VaultPage({
           </div>
         </Dialog>
       )}
+      {backupMode && (
+        <BackupDialog
+          mode={backupMode}
+          onClose={() => setBackupMode(null)}
+          onResult={(result) => {
+            setBackupMode(null);
+            setBackupResult(result);
+            onComplete(result.restored ? "备份已恢复并通过校验" : "备份校验通过");
+          }}
+          onNotice={onNotice}
+        />
+      )}
+      {backupResult && (
+        <Dialog title="备份结果" onClose={() => setBackupResult(null)}>
+          <div className="backup-result">
+            <CircleCheck size={22} />
+            <strong>{backupResult.restored ? "恢复完成" : "备份校验通过"}</strong>
+            <div className="backup-result-grid">
+              <span>格式版本</span><strong>{backupResult.format_version}</strong>
+              <span>数据表</span><strong>{backupResult.table_count}</strong>
+              <span>数据行</span><strong>{backupResult.row_count}</strong>
+              <span>恢复密钥</span><StateChip value={backupResult.vault_recovery_key_valid ? "valid" : "invalid"} />
+              <span>校验和</span><StateChip value={backupResult.checksums_valid ? "valid" : "invalid"} />
+            </div>
+            <div className="dialog-actions">
+              <Button tone="primary" onClick={() => setBackupResult(null)}>
+                <Check size={16} />
+                完成
+              </Button>
+            </div>
+          </div>
+        </Dialog>
+      )}
     </div>
+  );
+}
+
+function BackupDialog({
+  mode,
+  onClose,
+  onResult,
+  onNotice
+}: {
+  mode: "create" | "verify" | "restore";
+  onClose: () => void;
+  onResult: (result: VaultBackupSummary & { restored?: boolean }) => void;
+  onNotice: (message: string, tone?: "success" | "error") => void;
+}) {
+  const [recoveryKey, setRecoveryKey] = useState("");
+  const [packageFile, setPackageFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+  const isCreate = mode === "create";
+  const isRestore = mode === "restore";
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!recoveryKey.trim() || (!isCreate && !packageFile)) {
+      onNotice(isCreate ? "请输入恢复密钥" : "请输入恢复密钥并选择备份文件", "error");
+      return;
+    }
+    setBusy(true);
+    try {
+      if (isCreate) {
+        const result = await api.createBackup(recoveryKey.trim());
+        const url = URL.createObjectURL(result.blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = result.filename;
+        anchor.click();
+        URL.revokeObjectURL(url);
+        onResult({
+          format_version: Number(result.formatVersion ?? 0),
+          table_count: Number(result.tableCount ?? 0),
+          row_count: Number(result.rowCount ?? 0),
+          vault_recovery_key_valid: true,
+          checksums_valid: true
+        });
+      } else {
+        const result = isRestore
+          ? await api.restoreBackup(recoveryKey.trim(), packageFile!)
+          : await api.verifyBackup(recoveryKey.trim(), packageFile!);
+        onResult(result);
+      }
+    } catch (error) {
+      onNotice(toMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog title={isCreate ? "导出加密备份" : isRestore ? "恢复加密备份" : "校验加密备份"} onClose={onClose}>
+      <form className="dialog-form" onSubmit={submit}>
+        <label>
+          <span>恢复密钥</span>
+          <input
+            type="password"
+            autoComplete="off"
+            value={recoveryKey}
+            onChange={(event) => setRecoveryKey(event.target.value)}
+            placeholder="输入初始化时保存的恢复密钥"
+            required
+          />
+        </label>
+        {!isCreate && (
+          <label>
+            <span>备份文件</span>
+            <input
+              type="file"
+              accept=".json,application/json,application/octet-stream"
+              onChange={(event) => setPackageFile(event.target.files?.[0] ?? null)}
+              required
+            />
+          </label>
+        )}
+        <p className="form-hint">
+          {isCreate
+            ? "文件只在本地生成下载，不会把恢复密钥写入页面状态或服务端日志。"
+            : isRestore
+              ? "恢复只允许写入空的管理库，完成后应重新执行只读解密验证。"
+              : "校验只读取文件，不会修改当前管理库。"}
+        </p>
+        <div className="dialog-actions">
+          <Button onClick={onClose}>取消</Button>
+          <Button tone="primary" type="submit" disabled={busy}>
+            {busy ? <LoaderCircle className="spin" size={16} /> : isCreate ? <Download size={16} /> : <ShieldCheck size={16} />}
+            {busy ? "处理中" : isCreate ? "导出" : isRestore ? "恢复" : "开始校验"}
+          </Button>
+        </div>
+      </form>
+    </Dialog>
   );
 }
 
@@ -1378,6 +1676,208 @@ function BindDialog({
           <Button tone="primary" type="submit" disabled={busy || !walletId}>
             {busy ? <LoaderCircle className="spin" size={16} /> : <Link2 size={16} />}
             创建任务
+          </Button>
+        </div>
+      </form>
+    </Dialog>
+  );
+}
+
+type WorkflowPair = { accountId: string; walletId: string };
+
+function WorkflowDialog({
+  accounts,
+  refresh,
+  onClose,
+  onComplete,
+  onNotice
+}: {
+  accounts: Account[];
+  refresh: number;
+  onClose: () => void;
+  onComplete: (message: string) => void;
+  onNotice: (message: string, tone?: "success" | "error") => void;
+}) {
+  const wallets = useResource(api.wallets, refresh);
+  const bindings = useResource(api.bindings, refresh);
+  const [name, setName] = useState(`绑定并转发 ${new Date().toLocaleDateString("zh-CN")}`);
+  const [repostTarget, setRepostTarget] = useState("");
+  const [dispatchLimit, setDispatchLimit] = useState(10);
+  const [pairs, setPairs] = useState<WorkflowPair[]>([{ accountId: "", walletId: "" }]);
+  const [busy, setBusy] = useState(false);
+
+  const occupiedAccounts = useMemo(
+    () =>
+      new Set(
+        (bindings.value?.items ?? [])
+          .filter((binding) => binding.state !== "archived")
+          .map((binding) => binding.social_account_id)
+      ),
+    [bindings.value]
+  );
+  const occupiedWallets = useMemo(
+    () =>
+      new Set(
+        (bindings.value?.items ?? [])
+          .filter((binding) => binding.state !== "archived")
+          .map((binding) => binding.wallet_id)
+      ),
+    [bindings.value]
+  );
+  const availableAccounts = accounts.filter(
+    (account) => account.state === "active" && !occupiedAccounts.has(account.id)
+  );
+  const availableWallets = (wallets.value?.items ?? []).filter(
+    (wallet) => wallet.state === "active" && !occupiedWallets.has(wallet.id)
+  );
+
+  const autoPair = () => {
+    const pairCount = Math.min(10, availableAccounts.length, availableWallets.length);
+    setPairs(
+      Array.from({ length: pairCount }, (_, index) => ({
+        accountId: availableAccounts[index].id,
+        walletId: availableWallets[index].id
+      }))
+    );
+  };
+
+  const updatePair = (index: number, field: keyof WorkflowPair, value: string) => {
+    setPairs((current) =>
+      current.map((pair, pairIndex) =>
+        pairIndex === index ? { ...pair, [field]: value } : pair
+      )
+    );
+  };
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (
+      pairs.some((pair) => !pair.accountId || !pair.walletId) ||
+      !repostTarget.trim() ||
+      !name.trim()
+    ) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.createWorkflowBatch({
+        name,
+        dispatch_limit: dispatchLimit,
+        items: pairs.map((pair) => ({
+          social_account_id: pair.accountId,
+          wallet_id: pair.walletId,
+          repost_target: repostTarget
+        }))
+      });
+      onComplete(`已创建 ${pairs.length} 组批量执行任务`);
+    } catch (error) {
+      onNotice(toMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog title="创建批量绑定并转发" onClose={onClose} wide>
+      <form className="dialog-form" onSubmit={submit}>
+        <div className="workflow-header">
+          <label>
+            <span>批次名称</span>
+            <input value={name} onChange={(event) => setName(event.target.value)} required />
+          </label>
+          <label>
+            <span>转发目标</span>
+            <input
+              value={repostTarget}
+              onChange={(event) => setRepostTarget(event.target.value)}
+              placeholder="X 推文链接或 ID"
+              required
+            />
+          </label>
+          <label>
+            <span>并发窗口</span>
+            <input
+              type="number"
+              min={1}
+              max={32}
+              value={dispatchLimit}
+              onChange={(event) => setDispatchLimit(Number(event.target.value) || 1)}
+              required
+            />
+          </label>
+        </div>
+        <div className="workflow-pairs">
+          <div className="workflow-pairs-heading">
+            <strong>账号与地址配对</strong>
+            <div className="toolbar-actions">
+              <Button onClick={autoPair} disabled={!availableAccounts.length || !availableWallets.length}>
+                <RefreshCw size={15} />
+                自动配对前 10 组
+              </Button>
+              <Button
+                onClick={() => setPairs((current) => [...current, { accountId: "", walletId: "" }])}
+                disabled={pairs.length >= Math.min(availableAccounts.length, availableWallets.length)}
+              >
+                <Plus size={15} />
+                添加配对
+              </Button>
+            </div>
+          </div>
+          {pairs.map((pair, index) => {
+            const otherAccountIds = new Set(
+              pairs.filter((_, pairIndex) => pairIndex !== index).map((item) => item.accountId)
+            );
+            const otherWalletIds = new Set(
+              pairs.filter((_, pairIndex) => pairIndex !== index).map((item) => item.walletId)
+            );
+            return (
+              <div className="workflow-pair-row" key={index}>
+                <span className="pair-index">{String(index + 1).padStart(2, "0")}</span>
+                <select
+                  value={pair.accountId}
+                  onChange={(event) => updatePair(index, "accountId", event.target.value)}
+                  required
+                >
+                  <option value="">选择账号</option>
+                  {availableAccounts
+                    .filter((account) => account.id === pair.accountId || !otherAccountIds.has(account.id))
+                    .map((account) => (
+                      <option key={account.id} value={account.id}>@{account.handle}</option>
+                    ))}
+                </select>
+                <ArrowRight size={16} />
+                <select
+                  value={pair.walletId}
+                  onChange={(event) => updatePair(index, "walletId", event.target.value)}
+                  required
+                >
+                  <option value="">选择地址</option>
+                  {availableWallets
+                    .filter((wallet) => wallet.id === pair.walletId || !otherWalletIds.has(wallet.id))
+                    .map((wallet) => (
+                      <option key={wallet.id} value={wallet.id}>{compact(wallet.address, 12, 8)}</option>
+                    ))}
+                </select>
+                <IconButton
+                  label="移除配对"
+                  onClick={() => setPairs((current) => current.filter((_, pairIndex) => pairIndex !== index))}
+                  disabled={pairs.length === 1}
+                  tone="danger"
+                >
+                  <X size={16} />
+                </IconButton>
+              </div>
+            );
+          })}
+        </div>
+        <p className="form-hint">
+          每组会按“登录校验 → 绑定地址 → 转发 → 领取”顺序执行；单组失败不会占用其他配对。
+        </p>
+        <div className="dialog-actions">
+          <Button onClick={onClose}>取消</Button>
+          <Button tone="primary" type="submit" disabled={busy || !availableAccounts.length || !availableWallets.length}>
+            {busy ? <LoaderCircle className="spin" size={16} /> : <Layers3 size={16} />}
+            创建 {pairs.length} 组
           </Button>
         </div>
       </form>
