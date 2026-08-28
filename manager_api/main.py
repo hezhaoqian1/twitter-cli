@@ -8,6 +8,8 @@ from typing import Any
 from fastapi import FastAPI
 from sqlalchemy import create_engine, text
 
+from .api.routers.accounts import router as accounts_router
+from .api.routers.imports import router as imports_router
 from .config import ManagerSettings, get_settings
 
 Probe = Callable[[], None]
@@ -55,6 +57,8 @@ def create_app(
     check_redis = redis_probe or (lambda: _redis_probe(runtime))
 
     app = FastAPI(title="Account Wallet Task Manager", version="0.1.0")
+    app.include_router(imports_router)
+    app.include_router(accounts_router)
 
     @app.get("/health/live")
     def live() -> dict[str, str]:

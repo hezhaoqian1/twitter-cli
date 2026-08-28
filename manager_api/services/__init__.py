@@ -1,5 +1,6 @@
 """Manager application services."""
 
+from .imports import AccountImportService
 from .vault import (
     VaultAlreadyInitializedError,
     VaultError,
@@ -8,6 +9,7 @@ from .vault import (
 )
 
 __all__ = [
+    "AccountImportService",
     "VaultAlreadyInitializedError",
     "VaultError",
     "VaultService",

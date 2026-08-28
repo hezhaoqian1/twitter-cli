@@ -1,5 +1,14 @@
 """Pydantic schemas for manager API contracts."""
 
+from .accounts import (
+    AccountImportCommitResponse,
+    AccountImportPreviewResponse,
+    AccountImportRequest,
+    AccountImportRowResponse,
+    AccountImportSummary,
+    AccountListItem,
+    AccountListResponse,
+)
 from .vault import (
     VaultInitializeResponse,
     VaultPasswordRequest,
@@ -8,6 +17,13 @@ from .vault import (
 )
 
 __all__ = [
+    "AccountImportCommitResponse",
+    "AccountImportPreviewResponse",
+    "AccountImportRequest",
+    "AccountImportRowResponse",
+    "AccountImportSummary",
+    "AccountListItem",
+    "AccountListResponse",
     "VaultInitializeResponse",
     "VaultPasswordRequest",
     "VaultRecoveryKeyRequest",

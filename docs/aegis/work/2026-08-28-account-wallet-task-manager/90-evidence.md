@@ -75,5 +75,25 @@ Date: `2026-08-28`
 
 - The API image and local services have been statically validated; a live
   PostgreSQL/Redis container startup and migration check remains outstanding.
-- Vault API routers, account import, wallet derivation, task services, worker
-  recovery, backup/restore, and UI behavior remain future slices.
+- HTTP Vault unlock/session wiring is not part of the account import slice, so
+  the import service requires an explicitly unlocked `VaultService` for
+  encrypted commit. The next Vault API slice will provide that request-scoped
+  runtime dependency.
+- Wallet derivation, task services, worker recovery, backup/restore, and UI
+  behavior remain future slices.
+
+## Batch 2, Task 4: Account Import Evidence
+
+- Account TSV contract is seven columns in the current user-confirmed order:
+  `handle`, `password`, `totp`, `email`, `email_password`, `token`, `cookie`.
+- Preview preserves one-based physical line numbers and classifies malformed,
+  duplicate-in-file, existing-account, and conflicting-session rows.
+- Preview and account list schemas contain masked identity/status fields only;
+  source content, plaintext secrets, ciphertext, and secret envelopes are not
+  returned.
+- Commit creates one `ImportBatch` and one `ImportRow` per input line, skips
+  duplicate/conflicting rows by default, and encrypts password, TOTP, mailbox
+  password, token, and Cookie fields with Vault AAD bound to the secret record.
+- Focused import and redaction suite: `5 passed`.
+- Full non-smoke suite: `275 passed, 6 deselected`.
+- Ruff, mypy, compileall, and `git diff --check` completed successfully.
