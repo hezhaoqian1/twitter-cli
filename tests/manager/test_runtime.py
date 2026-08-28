@@ -4,7 +4,11 @@ from sqlalchemy.orm import Session
 from manager_api.config import ManagerSettings
 from manager_api.db.base import Base
 from manager_api.main import create_app
+from manager_api.models.tasks import ResourceLease, TaskJob, TaskState
+from manager_api.services.runtime import collect_runtime_metrics
 from manager_api.services.vault import VaultRuntime, VaultService
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 
 def _settings() -> ManagerSettings:
@@ -84,3 +88,81 @@ def test_vault_services_share_the_app_runtime_key() -> None:
             "token",
             envelope,
         ) == b"secret-fixture"
+
+
+class _RuntimeRedis:
+    """Deterministic Redis metrics double."""
+
+    def __init__(self) -> None:
+        self.lengths = {"ready": 4, "processing": 1}
+        self.heartbeats = {"worker-a": "2026-08-29T10:00:00+00:00"}
+
+    def llen(self, name: str) -> int:
+        return self.lengths.get(name, 0)
+
+    def hgetall(self, name: str) -> dict[str, str]:
+        return self.heartbeats if name == "heartbeats" else {}
+
+
+def test_runtime_metrics_aggregate_queue_tasks_leases_and_heartbeats() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 8, 29, 10, 0, 20, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        finished = TaskJob(
+            kind="bind",
+            state=TaskState.SUCCEEDED,
+            external_target="fixture",
+            idempotency_key=f"finished-{uuid4()}",
+            scheduled_at=now - timedelta(minutes=2),
+            finished_at=now - timedelta(minutes=1),
+        )
+        active = TaskJob(
+            kind="repost",
+            state=TaskState.RUNNING,
+            external_target="fixture",
+            idempotency_key=f"active-{uuid4()}",
+            scheduled_at=now - timedelta(minutes=1),
+            lease_keys=["account:fixture"],
+        )
+        session.add_all([finished, active])
+        session.flush()
+        session.add(
+            ResourceLease(
+                lease_key="account:fixture",
+                task_job_id=active.id,
+                owner_token="worker-fixture",
+                acquired_at=now - timedelta(seconds=20),
+                expires_at=now + timedelta(seconds=10),
+            )
+        )
+        session.flush()
+
+        metrics = collect_runtime_metrics(
+            session,
+            _RuntimeRedis(),
+            now=now,
+            ready_key="ready",
+            processing_key="processing",
+            heartbeat_key="heartbeats",
+        )
+
+    assert metrics.queues.ready == 4
+    assert metrics.queues.processing == 1
+    assert metrics.tasks.total == 2
+    assert metrics.tasks.active == 1
+    assert metrics.tasks.counts[TaskState.SUCCEEDED.value] == 1
+    assert metrics.leases.active == 1
+    assert metrics.leases.expiring_soon == 1
+    assert metrics.workers.active == 1
+
+
+def test_runtime_metrics_route_is_registered() -> None:
+    app = create_app(
+        ManagerSettings(
+            database_url="sqlite+pysqlite:///:memory:",
+            redis_url="redis://localhost/0",
+            session_secret="test-session-secret-123",
+        )
+    )
+    assert "/api/runtime/metrics" in app.openapi()["paths"]

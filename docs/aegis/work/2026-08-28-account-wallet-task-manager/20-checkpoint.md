@@ -182,3 +182,16 @@ is final diff review and shipping decisions.
   `0003`, and `0004`; SQLite keeps its existing table-rebuild path.
 - A fresh tunnel probe returned PostgreSQL `SELECT 1`, Redis `PING=True`, and
   application readiness with both checks `ok` on 2026-08-28.
+
+## Runtime Observability Checkpoint
+
+- `GET /api/runtime/metrics` now owns the read-only aggregation of queue
+  depth, task-state counts, resource leases, completion time, and Worker
+  heartbeat summary.
+- The Overview page consumes that endpoint and keeps runtime health distinct
+  from account and wallet inventory totals.
+- Verification: `338 passed, 6 deselected, 1 warning`; Ruff, mypy,
+  `git diff --check`, bundled TypeScript compilation, and the Vite production
+  build passed.
+- The Clash tunnel remains the verified path for Railway PostgreSQL and Redis
+  from this workstation.
