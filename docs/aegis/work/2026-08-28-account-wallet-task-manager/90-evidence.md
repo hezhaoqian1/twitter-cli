@@ -322,3 +322,18 @@ Date: `2026-08-28`
   as `ok` on 2026-08-28.
 - The probe did not write application data and did not print connection
   credentials.
+
+## Runtime Observability Slice
+
+- Added read-only `GET /api/runtime/metrics` aggregation for Redis ready and
+  processing queue depth, durable task counts, active and expiring leases,
+  latest task completion, and redacted Worker heartbeat counts.
+- The Overview page now renders the runtime snapshot separately from account,
+  wallet, binding, and task totals.
+- Runtime metrics use the existing Railway configuration and can be checked
+  through `127.0.0.1:7890` without exposing provider credentials or vault
+  ciphertext.
+- Focused runtime tests: `6 passed`.
+- Fresh complete suite after the slice: `338 passed, 6 deselected, 1 warning`.
+- Fresh static checks: Ruff and mypy passed. Bundled Node validation passed
+  `tsc -b` and the Vite production build (`1578 modules transformed`).
