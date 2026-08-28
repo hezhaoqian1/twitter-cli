@@ -24,6 +24,7 @@ class TaskWorker:
     def __init__(self, session: Session, *, scheduler: Scheduler | None = None) -> None:
         self.session = session
         self.scheduler = scheduler or Scheduler(session)
+        self._active_owner_tokens: set[str] = set()
 
     def run_one(self, grant: DispatchGrant, handler: WorkerHandler) -> TaskJob:
         """Run one job and always release the matching resource leases."""
@@ -36,6 +37,7 @@ class TaskWorker:
                 "worker can only start a leased task",
             )
 
+        self._active_owner_tokens.add(grant.owner_token)
         tasks.transition(
             job.id,
             TaskState.RUNNING,
@@ -98,11 +100,14 @@ class TaskWorker:
             )
             return tasks.get(job.id)
         finally:
-            leases.release(
-                grant.owner_token,
-                task_job_id=grant.task_job_id,
-                lease_keys=grant.lease_keys,
-            )
+            try:
+                leases.release(
+                    grant.owner_token,
+                    task_job_id=grant.task_job_id,
+                    lease_keys=grant.lease_keys,
+                )
+            finally:
+                self._active_owner_tokens.discard(grant.owner_token)
 
     def recover_expired(self) -> list[UUID]:
         """Run the durable recovery sweep for crashed or stopped workers."""
@@ -134,6 +139,12 @@ class TaskWorker:
         queue.acknowledge(message)
         return result
 
-    def shutdown(self, owner_token: str) -> int:
-        """Release every lease owned by this worker before graceful shutdown."""
-        return LeaseRepository(self.session).release(owner_token)
+    def shutdown(self, owner_token: str | None = None) -> int:
+        """Release active leases before graceful shutdown."""
+        tokens = (
+            {owner_token}
+            if owner_token is not None
+            else set(self._active_owner_tokens)
+        )
+        leases = LeaseRepository(self.session)
+        return sum(leases.release(token) for token in tokens)

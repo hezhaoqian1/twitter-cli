@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
+import time
 
+from .heartbeat import WorkerHeartbeat
 from .queue import TaskQueue
 from .scheduler import DispatchGrant, Scheduler
 from .worker import TaskWorker
@@ -25,6 +27,17 @@ class RunnerDrainResult:
     cycles: int
     dispatched: int
     completed: int
+
+
+@dataclass(frozen=True)
+class RunnerLoopResult:
+    """Redacted summary returned after a worker receives a stop request."""
+
+    cycles: int
+    recovered: int
+    dispatched: int
+    completed: int
+    errors: int
 
 
 class TaskRunner:
@@ -98,3 +111,79 @@ class TaskRunner:
             dispatched=total_dispatched,
             completed=total_completed,
         )
+
+    def run_forever(
+        self,
+        *,
+        heartbeat: WorkerHeartbeat | None = None,
+        stop_requested: Callable[[], bool] | None = None,
+        dispatch_limit: int | None = None,
+        receive_timeout: int = 1,
+        recovery_interval_seconds: float = 30.0,
+        heartbeat_interval_seconds: float = 15.0,
+        idle_sleep_seconds: float = 1.0,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> RunnerLoopResult:
+        """Consume work until stopped while maintaining recovery and liveness."""
+        if receive_timeout < 0:
+            raise ValueError("receive_timeout must not be negative")
+        if recovery_interval_seconds <= 0:
+            raise ValueError("recovery_interval_seconds must be positive")
+        if heartbeat_interval_seconds <= 0:
+            raise ValueError("heartbeat_interval_seconds must be positive")
+        if idle_sleep_seconds <= 0:
+            raise ValueError("idle_sleep_seconds must be positive")
+
+        should_stop = stop_requested or (lambda: False)
+        cycles = recovered = dispatched = completed = errors = 0
+        last_recovery = monotonic() - recovery_interval_seconds
+
+        try:
+            if heartbeat is not None:
+                heartbeat.start(heartbeat_interval_seconds)
+            while not should_stop():
+                current = monotonic()
+                if current - last_recovery >= recovery_interval_seconds:
+                    recovered += len(self.worker.recover_expired())
+                    self._commit()
+                    last_recovery = current
+
+                dispatched += len(self.dispatch(limit=dispatch_limit))
+                self._commit()
+                try:
+                    result = self.run_one(timeout=receive_timeout)
+                except Exception:
+                    # 单个任务失败已经回放到可靠队列，继续处理其他独立任务。
+                    self._rollback()
+                    errors += 1
+                    sleep(idle_sleep_seconds)
+                    continue
+
+                cycles += 1
+                if result is None:
+                    sleep(idle_sleep_seconds)
+                    continue
+                self._commit()
+                completed += 1
+        finally:
+            self.worker.shutdown()
+            self._commit()
+            if heartbeat is not None:
+                heartbeat.close()
+
+        return RunnerLoopResult(
+            cycles=cycles,
+            recovered=recovered,
+            dispatched=dispatched,
+            completed=completed,
+            errors=errors,
+        )
+
+    def _commit(self) -> None:
+        """Commit one durable lifecycle boundary for the long-lived session."""
+        self.worker.session.commit()
+
+    def _rollback(self) -> None:
+        """Clear a failed transaction before the next queue iteration."""
+        self.worker.session.rollback()

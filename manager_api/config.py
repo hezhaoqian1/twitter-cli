@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +27,12 @@ class ManagerSettings(BaseSettings):
     external_poll_interval_seconds: float = Field(default=15.0, gt=0, le=3600)
     external_poll_timeout_seconds: float = Field(default=900.0, gt=0, le=86400)
     healthcheck_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
+    worker_lease_ttl_seconds: float = Field(default=120.0, gt=0, le=86400)
+    worker_recovery_interval_seconds: float = Field(default=30.0, gt=0, le=3600)
+    worker_heartbeat_interval_seconds: float = Field(default=15.0, gt=0, le=3600)
+    worker_heartbeat_ttl_seconds: float = Field(default=45.0, gt=0, le=86400)
+    worker_idle_sleep_seconds: float = Field(default=1.0, gt=0, le=60)
+    worker_vault_password: SecretStr | None = None
 
     @property
     def sqlalchemy_url(self) -> str:
