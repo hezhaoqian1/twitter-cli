@@ -337,3 +337,23 @@ Date: `2026-08-28`
 - Fresh complete suite after the slice: `338 passed, 6 deselected, 1 warning`.
 - Fresh static checks: Ruff and mypy passed. Bundled Node validation passed
   `tsc -b` and the Vite production build (`1578 modules transformed`).
+
+## Worker Runtime Slice
+
+- Added `manager_api.heartbeat.WorkerHeartbeat`, which writes an ISO timestamp
+  under one process ID in `manager:workers:heartbeats` and removes only that
+  field during shutdown.
+- Added `TaskRunner.run_forever`, which periodically recovers expired leases,
+  dispatches durable jobs, consumes reliable-list messages, commits each
+  lifecycle boundary, and continues after one task-level exception.
+- Added `scripts/manager_worker.py` as the independent Worker process entry
+  point. It keeps X/Kredo providers behind the existing adapter contracts and
+  loads the Kredo workflow factory from an environment module path.
+- Added focused tests for heartbeat ownership, clean stop, durable completion,
+  and queue drain behavior: `7 passed`.
+- Fresh complete non-smoke suite: `340 passed, 6 deselected, 1 warning`.
+- Ruff and mypy passed for the manager runtime and Worker entry point.
+- Bundled Node validation passed `tsc -b` and the Vite production build
+  (`1578 modules transformed`).
+- Through Clash `127.0.0.1:7890`, PostgreSQL returned `SELECT 1` and Redis
+  returned `PING=True`; no application data was written.

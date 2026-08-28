@@ -23,10 +23,14 @@ Date: `2026-08-28`
 15. Implement Batch 5, Task 12: encrypted backup and restore. (completed)
 16. Implement Batch 5, Task 13: Railway deployment and end-to-end verification.
     (in progress)
+17. Implement deployable Worker runtime with heartbeats and graceful stop.
+    (completed)
+18. Verify Worker runtime, frontend build, and Clash dependency path.
+    (completed)
 
 ## Active Slice
 
-Batch 5, Task 13: Railway deployment and end-to-end verification.
+Batch 5, Task 13: final diff review and shipping decision.
 
 ## Completed
 
@@ -95,6 +99,16 @@ Batch 5, Task 13: Railway deployment and end-to-end verification.
   `blocked` state; retrying the predecessor can requeue the blocked chain.
 - Cancellation is cooperative for running workers, immediate for leased work,
   and preserves a redacted cancellation-request event.
+- `WorkerHeartbeat` publishes one process-owned Redis hash entry and removes it
+  during graceful shutdown.
+- `TaskRunner.run_forever` now performs recovery, dispatch, reliable-list
+  consumption, lifecycle commits, heartbeat pulses, and clean stop handling.
+- `scripts/manager_worker.py` is the deployable Worker entry point. It loads
+  the Kredo workflow factory from `MANAGER_KREDO_WORKFLOW_FACTORY`, uses the
+  existing X and Kredo adapter boundary, and reads vault unlock material only
+  from `WORKER_VAULT_PASSWORD`.
+- `docs/manager-worker-runtime.md` records the API/Worker service split and
+  the `127.0.0.1:7890` Clash probe path without connection values.
 
 ## Evidence
 
@@ -195,3 +209,18 @@ is final diff review and shipping decisions.
   build passed.
 - The Clash tunnel remains the verified path for Railway PostgreSQL and Redis
   from this workstation.
+
+## Worker Runtime Checkpoint
+
+- Added a process-scoped Redis heartbeat owner with explicit cleanup.
+- Added a long-lived runner loop with recovery cadence, queue consumption,
+  transaction commits, exception isolation, and TERM/INT stop behavior.
+- Added `scripts/manager_worker.py` for the independent Railway Worker
+  service; provider details remain injected through a factory path.
+- Focused Worker runtime suite: `7 passed`.
+- Complete non-smoke suite: `340 passed, 6 deselected, 1 warning`.
+- Ruff and mypy passed.
+- Bundled Node runtime passed TypeScript compilation and Vite production
+  build (`1578 modules transformed`).
+- Through Clash `127.0.0.1:7890`, PostgreSQL returned `SELECT 1` and Redis
+  returned `PING=True`; the probe wrote no application data.
