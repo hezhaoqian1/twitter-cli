@@ -4,6 +4,10 @@ Date: `2026-08-28`
 Status: `proposed for user review`  
 Scope: local-first, single-administrator management application
 
+Deployment decision: Railway is the target managed-hosting platform for the
+server deployment. Railway PostgreSQL and Railway Redis are the production
+database and queue services.
+
 ## 1. Decision Summary
 
 Build a separate local web application around the existing `twitter-cli`
@@ -23,7 +27,7 @@ Encrypted vault     Worker processes
                Per-task browser contexts
 ```
 
-The same containers run on a laptop and later on a server. PostgreSQL owns
+The same containers run on a laptop and later on Railway. PostgreSQL owns
 durable state and resource leases. Redis transports queued work only; a lost
 Redis item is reconstructed from durable job rows.
 
@@ -473,7 +477,73 @@ POST   /api/vault/restore/verify
 The UI never receives unwrapped private material except through a deliberate,
 freshly authenticated export endpoint.
 
-## 12. Failures and Operator Experience
+## 12. Railway Deployment and Configuration
+
+Railway is the canonical server deployment target. The application is deployed
+as three services in one Railway project:
+
+```text
+web       React build + FastAPI API
+worker    scheduler and task workers
+browser   optional dedicated browser worker when browser concurrency needs
+          separate CPU and memory limits
+```
+
+The web and worker services connect to Railway-managed PostgreSQL and Redis
+through Railway private networking. The browser service is deferred for the
+first server deployment; begin with browser workers in the worker service and
+split it only when observed browser memory pressure warrants a separate owner.
+
+### 12.1 Configuration Contract
+
+Secrets are configured as Railway service variables and local `.env` files
+that are excluded from Git:
+
+```text
+DATABASE_URL
+REDIS_URL
+MANAGER_PUBLIC_URL
+MANAGER_SESSION_SECRET
+VAULT_RUNTIME_KEY_CACHE_TTL_SECONDS
+WORKER_CONCURRENCY
+BROWSER_CONCURRENCY
+TASK_POLL_INTERVAL_SECONDS
+TASK_POLL_DEADLINE_SECONDS
+```
+
+`DATABASE_URL` is the Railway PostgreSQL connection URL and `REDIS_URL` is the
+Railway Redis connection URL. Their values are never copied into source files,
+Markdown documents, tests, screenshots, command history, or Git commits.
+
+Railway variables are set separately for `web` and `worker`. Every worker
+release uses the same application image and migration version as the web
+release. Database migrations run as an explicit release command before workers
+are allowed to consume queued jobs.
+
+### 12.2 Local-to-Railway Migration
+
+1. Create an encrypted backup package from the local Vault & Backup screen.
+2. Start the same application version on Railway with empty Railway PostgreSQL
+   and Redis services.
+3. Run migrations, restore the encrypted package, and perform the read-only
+   integrity check with the recovery key.
+4. Keep task dispatch disabled until counts, binding constraints, and vault
+   decryptability pass.
+5. Enable one worker and run a small manual batch before raising concurrency.
+
+### 12.3 Railway Operations
+
+- PostgreSQL automated backups supplement, but do not replace, encrypted
+  application backup packages.
+- Redis is disposable transport state; durable jobs, leases, and task events
+  remain in PostgreSQL.
+- A Railway redeploy must stop workers gracefully, allow leases to expire, and
+  let the scheduler recover eligible jobs from PostgreSQL.
+- Rotating `DATABASE_URL` or `REDIS_URL` requires updating Railway variables,
+  redeploying web and worker services, and confirming the Overview health
+  indicators before re-enabling dispatch.
+
+## 13. Failures and Operator Experience
 
 | Situation | System behavior |
 |---|---|
@@ -487,7 +557,7 @@ freshly authenticated export endpoint.
 | Incorrect unlock password | do not distinguish vault existence from bad input |
 | Failed restore validation | keep dispatch disabled and preserve original backup |
 
-## 13. Observability and Audit
+## 14. Observability and Audit
 
 Every job has a trace ID. Structured logs include job ID, batch ID, account ID,
 wallet ID, adapter, state transition, elapsed time, and error class; they
@@ -505,7 +575,7 @@ The audit log records:
 The overview page shows queue depth, workers alive, leased resources, waiting
 external validations, recent failures, and backup health.
 
-## 14. Alternatives Considered
+## 15. Alternatives Considered
 
 ### A. Single Python process with SQLite and background threads
 
@@ -522,7 +592,7 @@ and a direct server migration path. Recommended.
 Appropriate only for significantly larger scale. It adds operational owners and
 failure modes before there is evidence that they are needed. Deferred.
 
-## 15. Architecture Integrity Review
+## 16. Architecture Integrity Review
 
 ### Invariants
 
@@ -555,7 +625,7 @@ Implementation planning should create ADRs for:
 2. lease transaction and worker recovery semantics;
 3. adapter contract and browser-context lifecycle.
 
-## 16. Acceptance Criteria
+## 17. Acceptance Criteria
 
 1. Importing a 500-row TSV produces per-row validation results, duplicate
    reporting, and no plaintext secrets in database logs or UI output.
@@ -575,7 +645,7 @@ Implementation planning should create ADRs for:
 9. The interface supports manual row actions and batch actions without hiding
    resource conflicts.
 
-## 17. Implementation Sequencing
+## 18. Implementation Sequencing
 
 After this design is approved, implementation planning should split work into:
 
