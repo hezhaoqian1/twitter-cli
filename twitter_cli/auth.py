@@ -83,7 +83,32 @@ def _diagnose_keychain_issues(diagnostics: List[str]) -> Optional[str]:
 
 
 def load_from_env() -> Optional[Dict[str, str]]:
-    """Load cookies from environment variables."""
+    """Load cookies from environment variables or an exported session file."""
+    cookie_file = os.environ.get("TWITTER_COOKIE_FILE", "").strip()
+    if cookie_file:
+        try:
+            with open(cookie_file, encoding="utf-8") as handle:
+                data = json.load(handle)
+            auth_token = str(data.get("auth_token", ""))
+            ct0 = str(data.get("ct0", ""))
+            cookie_string = str(data.get("cookie_string", ""))
+
+            # 兼容 Playwright 的 cookies 数组，避免丢失登录后的完整会话。
+            if not cookie_string and isinstance(data.get("cookies"), list):
+                cookie_string = "; ".join(
+                    "%s=%s" % (item["name"], item["value"])
+                    for item in data["cookies"]
+                    if isinstance(item, dict) and item.get("name") and item.get("value") is not None
+                )
+            if auth_token and ct0:
+                result = {"auth_token": auth_token, "ct0": ct0}
+                if cookie_string:
+                    result["cookie_string"] = cookie_string
+                return result
+            logger.debug("Cookie file is missing auth_token or ct0: %s", cookie_file)
+        except (OSError, TypeError, ValueError) as exc:
+            logger.debug("Could not load cookie file %s: %s", cookie_file, exc)
+
     auth_token = os.environ.get("TWITTER_AUTH_TOKEN", "")
     ct0 = os.environ.get("TWITTER_CT0", "")
     if auth_token and ct0:

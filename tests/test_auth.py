@@ -66,6 +66,33 @@ def test_load_from_env_logs_incomplete_env(monkeypatch, caplog) -> None:
     assert "Environment cookies incomplete" in caplog.text
 
 
+def test_load_from_cookie_file_includes_full_cookie_string(monkeypatch, tmp_path) -> None:
+    cookie_file = tmp_path / "session.json"
+    cookie_file.write_text(
+        json.dumps(
+            {
+                "auth_token": "file-token",
+                "ct0": "file-csrf",
+                "cookies": [
+                    {"name": "auth_token", "value": "file-token"},
+                    {"name": "ct0", "value": "file-csrf"},
+                    {"name": "guest_id", "value": "guest"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TWITTER_COOKIE_FILE", str(cookie_file))
+    monkeypatch.delenv("TWITTER_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("TWITTER_CT0", raising=False)
+
+    assert auth.load_from_env() == {
+        "auth_token": "file-token",
+        "ct0": "file-csrf",
+        "cookie_string": "auth_token=file-token; ct0=file-csrf; guest_id=guest",
+    }
+
+
 def test_extract_cookies_from_jar_logs_missing_required_cookies(caplog) -> None:
     class Cookie:
         def __init__(self, domain: str, name: str, value: str) -> None:
@@ -109,6 +136,7 @@ def test_extract_in_process_supports_arc(monkeypatch) -> None:
         brave=lambda: pytest.fail("brave should not be used when arc succeeds"),
     )
     monkeypatch.setitem(sys.modules, "browser_cookie3", fake_module)
+    monkeypatch.setattr(auth, "_iter_chrome_cookie_files", lambda _browser_name: [])
 
     cookies, diagnostics = auth._extract_in_process()
 
@@ -407,6 +435,7 @@ def test_extract_in_process_returns_diagnostics_on_failure(monkeypatch) -> None:
         brave=lambda: (_ for _ in ()).throw(BrowserError("Brave not found")),
     )
     monkeypatch.setitem(sys.modules, "browser_cookie3", fake_module)
+    monkeypatch.setattr(auth, "_iter_chrome_cookie_files", lambda _browser_name: [])
 
     cookies, diagnostics = auth._extract_in_process()
 

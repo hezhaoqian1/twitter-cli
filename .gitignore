@@ -5,7 +5,15 @@ dist/
 build/
 .venv/
 .env
+.env.manager
 *.json
+!railway.json
+!manager_ui/package.json
+!manager_ui/tsconfig.json
+!manager_ui/tsconfig.app.json
+!manager_ui/tsconfig.node.json
 !tests/fixtures/*.json
 !config.yaml
 .idea/
+.gstack/
+manager_ui/node_modules/
