@@ -79,6 +79,15 @@ The next real run should focus on workbench validation:
 5. Refresh the manager binding page or run read-only sync after Kredo updates.
 6. Scale the same action to a wave of up to 10 browser windows.
 
+## Regression Record
+
+On 2026-08-29, the full local suite reported `422 passed, 5 failed, 6
+deselected`. The five failures are existing Windows-specific assumptions:
+POSIX file permission bits are asserted on Windows, and Chrome profile lookup
+fixtures use a non-Windows path layout under `win32`. The focused workbench and
+probe suite passed with `32 passed`; Ruff, Mypy, and the manager UI production
+build also passed.
+
 The synthetic acceptance path already proves the manager can execute
 independent stage batches through bind, delayed repost polling, and claim when
 the provider states advance as expected.

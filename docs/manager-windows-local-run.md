@@ -176,6 +176,17 @@ If Kredo first creates an `about:blank` OAuth tab, leave the modal open for a
 moment. The workbench waits for Kredo's authorization URL and navigates that
 same tab to X. That tab remains open for manual binding and reposting.
 
+Recommended per-browser sequence:
+
+1. Keep the Kredo tab open and click `前往 X` from the task modal.
+2. Complete X binding and reposting in the new X tab.
+3. Return to Kredo, confirm the wallet action, refresh the task state, and
+   claim when eligible.
+4. Close the X tab and browser after the row is finished.
+
+The workbench does not invoke the separate `批量转发` operation. Do not start
+that stage for the same row while completing the manual X flow.
+
 The API response only contains binding id, process id, and screenshot path. It
 does not return X cookies, tokens, passwords, TOTP seeds,
 private keys, or mnemonics.

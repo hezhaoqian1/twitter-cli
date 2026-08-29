@@ -230,6 +230,24 @@ The workbench does not require a full Worker loop and does not chain into the
 next stage automatically. A row whose Kredo status updates slowly can remain
 open while other rows proceed.
 
+### Exact Manual Flow
+
+For each opened workbench, use this order:
+
+1. Leave the main tab on Kredo and confirm the wallet address shown by Kredo.
+2. In the Kredo task modal, click `前往 X`.
+3. Wait for the separate X tab to finish loading. If it first shows
+   `about:blank`, keep the Kredo modal open while the workbench repairs the
+   navigation.
+4. Complete the X account binding and repost manually in that X tab.
+5. Return to the Kredo tab, finish any wallet confirmation, refresh the task
+   state, and claim when the row is eligible.
+6. Close the X tab and the browser only after the manual work is complete.
+
+`打开工作台` does not run the separate `批量转发` stage. That stage remains an
+independent operation under `批量转发`; use only one of these paths for a row
+at a time.
+
 ## Stage-Oriented Operation
 
 Run each external step as its own unit. Do not treat login, binding, repost,
