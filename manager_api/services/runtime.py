@@ -10,8 +10,14 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..db.base import utc_now
-from ..models.tasks import ResourceLease, TaskJob, TaskState
+from ..models.accounts import AccountHealth, LifecycleState, SocialAccount
+from ..models.bindings import AccountWalletBinding, BindingState
+from ..models.tasks import ResourceLease, TaskJob, TaskKind, TaskState
+from ..models.wallets import Wallet
 from ..schemas.runtime import (
+    OperationResourceCounts,
+    OperationsSummaryResponse,
+    OperationStageSummary,
     RuntimeLeaseMetrics,
     RuntimeMetricsResponse,
     RuntimeQueueMetrics,
@@ -124,3 +130,121 @@ def collect_runtime_metrics(
             heartbeat_ttl_seconds=heartbeat_ttl_seconds,
         ),
     )
+
+
+def collect_operations_summary(
+    session: Session,
+    *,
+    now: datetime | None = None,
+) -> OperationsSummaryResponse:
+    """聚合分阶段运营视图，只读取公开资源状态和任务状态。"""
+    current_time = now or utc_now()
+    active_account_ids = set(
+        session.scalars(
+            select(SocialAccount.id).where(SocialAccount.state == LifecycleState.ACTIVE)
+        ).all()
+    )
+    healthy_accounts = int(
+        session.scalar(
+            select(func.count()).select_from(SocialAccount).where(
+                SocialAccount.state == LifecycleState.ACTIVE,
+                SocialAccount.health == AccountHealth.HEALTHY,
+            )
+        )
+        or 0
+    )
+    active_wallet_ids = set(
+        session.scalars(
+            select(Wallet.id).where(Wallet.state == "active", Wallet.archived_at.is_(None))
+        ).all()
+    )
+    active_bindings = session.scalars(
+        select(AccountWalletBinding).where(AccountWalletBinding.archived_at.is_(None))
+    ).all()
+    occupied_account_ids = {binding.social_account_id for binding in active_bindings}
+    occupied_wallet_ids = {binding.wallet_id for binding in active_bindings}
+    bound_binding_ids = {
+        binding.id for binding in active_bindings if binding.state is BindingState.BOUND
+    }
+    pending_bindings = sum(1 for binding in active_bindings if binding.state is BindingState.PENDING)
+    waiting_tasks = _task_counts_by_kind(session, TaskState.WAITING_EXTERNAL_VALIDATION)
+    failed_tasks = _task_counts_by_kind(session, TaskState.FAILED)
+    succeeded_repost_bindings = set(
+        session.scalars(
+            select(TaskJob.binding_id).where(
+                TaskJob.kind == TaskKind.REPOST,
+                TaskJob.state == TaskState.SUCCEEDED,
+                TaskJob.binding_id.is_not(None),
+            )
+        ).all()
+    )
+    succeeded_claim_bindings = set(
+        session.scalars(
+            select(TaskJob.binding_id).where(
+                TaskJob.kind == TaskKind.CLAIM,
+                TaskJob.state == TaskState.SUCCEEDED,
+                TaskJob.binding_id.is_not(None),
+            )
+        ).all()
+    )
+    claim_ready = len((bound_binding_ids & succeeded_repost_bindings) - succeeded_claim_bindings)
+    available_accounts = len(active_account_ids - occupied_account_ids)
+    available_wallets = len(active_wallet_ids - occupied_wallet_ids)
+    bind_ready = min(available_accounts, available_wallets)
+    resources = OperationResourceCounts(
+        accounts_total=int(session.scalar(select(func.count()).select_from(SocialAccount)) or 0),
+        accounts_active=len(active_account_ids),
+        accounts_healthy=healthy_accounts,
+        accounts_available_for_binding=available_accounts,
+        wallets_total=int(session.scalar(select(func.count()).select_from(Wallet)) or 0),
+        wallets_active=len(active_wallet_ids),
+        wallets_available_for_binding=available_wallets,
+        bindings_total=len(active_bindings),
+        bindings_pending=pending_bindings,
+        bindings_bound=len(bound_binding_ids),
+    )
+    return OperationsSummaryResponse(
+        generated_at=current_time,
+        resources=resources,
+        stages=[
+            OperationStageSummary(
+                key="verify",
+                label="登录校验",
+                ready=resources.accounts_active,
+                waiting=waiting_tasks.get("verify_account", 0),
+                failed=failed_tasks.get("verify_account", 0),
+                detail="可对全部活跃 X 账号重新校验会话",
+            ),
+            OperationStageSummary(
+                key="bind",
+                label="绑定地址",
+                ready=bind_ready,
+                waiting=pending_bindings + waiting_tasks.get("bind", 0),
+                failed=failed_tasks.get("bind", 0),
+                detail="按未占用账号和未占用地址自动配对",
+            ),
+            OperationStageSummary(
+                key="repost",
+                label="转发推文",
+                ready=resources.bindings_bound,
+                waiting=waiting_tasks.get("repost", 0),
+                failed=failed_tasks.get("repost", 0),
+                detail="仅对已确认绑定的账号地址对创建任务",
+            ),
+            OperationStageSummary(
+                key="claim",
+                label="领取奖励",
+                ready=claim_ready,
+                waiting=waiting_tasks.get("claim", 0),
+                failed=failed_tasks.get("claim", 0),
+                detail="转发校验成功后进入领取候选池",
+            ),
+        ],
+    )
+
+
+def _task_counts_by_kind(session: Session, state: TaskState) -> dict[str, int]:
+    """按任务类型统计某个状态，给运营台显示瓶颈位置。"""
+    return {kind.value: int(count) for kind, count in session.execute(
+        select(TaskJob.kind, func.count()).where(TaskJob.state == state).group_by(TaskJob.kind)
+    ).all()}

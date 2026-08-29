@@ -72,6 +72,7 @@ export type Task = {
   started_at: string | null;
   finished_at: string | null;
   external_operation_ref: string | null;
+  target_configured: boolean;
   result_summary: string | null;
   failure_code: string | null;
   poll_deadline_at: string | null;
@@ -173,6 +174,35 @@ export type RuntimeMetrics = {
   };
 };
 
+export type OperationsSummary = {
+  generated_at: string;
+  resources: {
+    accounts_total: number;
+    accounts_active: number;
+    accounts_healthy: number;
+    accounts_available_for_binding: number;
+    wallets_total: number;
+    wallets_active: number;
+    wallets_available_for_binding: number;
+    bindings_total: number;
+    bindings_pending: number;
+    bindings_bound: number;
+  };
+  stages: Array<{
+    key: "verify" | "bind" | "repost" | "claim";
+    label: string;
+    ready: number;
+    waiting: number;
+    failed: number;
+    detail: string;
+  }>;
+};
+
+export type HealthReady = {
+  status: "ok" | "degraded";
+  checks: Record<string, "ok" | "down">;
+};
+
 type Page<T> = {
   items: T[];
   offset: number;
@@ -251,7 +281,9 @@ async function requestBackup(path: string, form: FormData) {
 }
 
 export const api = {
+  healthReady: () => request<HealthReady>("/health/ready"),
   runtimeMetrics: () => request<RuntimeMetrics>("/api/runtime/metrics"),
+  operationsSummary: () => request<OperationsSummary>("/api/runtime/operations-summary"),
   vaultStatus: () => request<VaultStatus>("/api/vault/status"),
   initializeVault: (password: string) =>
     request<{ initialized: boolean; recovery_key: string }>("/api/vault/initialize", {
@@ -366,6 +398,22 @@ export const api = {
     }>;
   }) =>
     request<TaskBatch>("/api/tasks/workflows", {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  createStageBatch: (input: {
+    name: string;
+    stage: "verify" | "bind" | "repost" | "claim";
+    dispatch_limit: number;
+    items: Array<{
+      social_account_id?: string;
+      wallet_id?: string;
+      binding_id?: string;
+      external_target?: string;
+      priority?: number;
+    }>;
+  }) =>
+    request<TaskBatch>("/api/tasks/stages", {
       method: "POST",
       body: JSON.stringify(input)
     }),

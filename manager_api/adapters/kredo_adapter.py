@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 
 from .protocol import (
@@ -101,11 +102,16 @@ class KredoAdapter:
             preflight=True,
         )
 
-    def status(self, operation: OperationMaterial) -> ExternalObservation:
+    def status(
+        self,
+        operation: OperationMaterial,
+        account: AccountMaterial | None = None,
+        wallet: WalletMaterial | None = None,
+    ) -> ExternalObservation:
         """Read one normalized Kredo state in an isolated workflow context."""
         try:
             with self._workflow_factory(operation) as workflow:
-                payload = workflow.status(operation)
+                payload = self._call_status(workflow, operation, account, wallet)
                 return self._normalize_observation(
                     payload,
                     fallback_ref=operation.operation_ref,
@@ -152,7 +158,7 @@ class KredoAdapter:
                 if preflight:
                     # 每次重试前都在当前独立上下文读取外部状态。
                     current = self._normalize_observation(
-                        workflow.status(operation),
+                        self._call_status(workflow, operation, account, wallet),
                         fallback_ref=operation.operation_ref,
                     )
                     if current.status.is_complete:
@@ -165,7 +171,10 @@ class KredoAdapter:
                                 attributes=current.evidence.to_dict(),
                             ),
                         )
-                    if current.status.is_delayed:
+                    if current.status.is_delayed and not (
+                        action_name == "claim"
+                        and current.evidence.attributes.get("repostVerified") is True
+                    ):
                         return ExternalOperation(
                             operation_ref=current.operation_ref,
                             status=current.status,
@@ -181,6 +190,24 @@ class KredoAdapter:
             raise
         except Exception as error:
             raise AdapterError.from_exception(action_name, error, retryable=True) from error
+
+    @staticmethod
+    def _call_status(
+        workflow,
+        operation: OperationMaterial,
+        account: AccountMaterial | None,
+        wallet: WalletMaterial | None,
+    ):
+        """兼容旧 status(operation) 和需要材料的新 status(operation, account, wallet)。"""
+        status = workflow.status
+        parameters = inspect.signature(status).parameters
+        accepts_varargs = any(
+            parameter.kind is inspect.Parameter.VAR_POSITIONAL
+            for parameter in parameters.values()
+        )
+        if accepts_varargs or len(parameters) >= 3:
+            return status(operation, account, wallet)
+        return status(operation)
 
     @classmethod
     def _normalize_operation(

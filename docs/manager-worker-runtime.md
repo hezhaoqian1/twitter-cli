@@ -74,3 +74,15 @@ uv run python scripts/manager_clash_tunnel.py \
 
 The tunnel replaces only the child process transport endpoints with loopback
 ports. It does not log application payloads or credentials.
+
+To run the local API through the same tunnel, use the ASGI factory entry point:
+
+```sh
+uv run python scripts/manager_clash_tunnel.py -- \
+  uv run --with uvicorn python -m uvicorn \
+  manager_api.main:create_app --factory \
+  --host 127.0.0.1 --port 8000
+```
+
+The `--factory` flag is required because `manager_api.main` exposes
+`create_app()` rather than a module-level `app`.

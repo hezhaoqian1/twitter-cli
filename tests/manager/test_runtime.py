@@ -5,7 +5,12 @@ from manager_api.config import ManagerSettings
 from manager_api.db.base import Base
 from manager_api.main import create_app
 from manager_api.models.tasks import ResourceLease, TaskJob, TaskState
+from manager_api.models.accounts import AccountHealth, LifecycleState, SocialAccount
+from manager_api.models.bindings import AccountWalletBinding, BindingState
+from manager_api.models.tasks import TaskKind
+from manager_api.models.wallets import Wallet
 from manager_api.services.runtime import collect_runtime_metrics
+from manager_api.services.runtime import collect_operations_summary
 from manager_api.services.vault import VaultRuntime, VaultService
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -166,3 +171,125 @@ def test_runtime_metrics_route_is_registered() -> None:
         )
     )
     assert "/api/runtime/metrics" in app.openapi()["paths"]
+    assert "/api/runtime/operations-summary" in app.openapi()["paths"]
+
+
+def test_operations_summary_counts_independent_stage_readiness() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime(2026, 8, 29, 10, 0, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        accounts = [
+            SocialAccount(
+                handle=f"stage-account-{index}",
+                normalized_handle=f"stage-account-{index}",
+                state=LifecycleState.ACTIVE,
+                health=AccountHealth.HEALTHY if index != 3 else AccountHealth.UNKNOWN,
+            )
+            for index in range(1, 5)
+        ]
+        wallets = [
+            Wallet(
+                address=f"0x{index:02x}" + "b" * 38,
+                normalized_address=f"0x{index:02x}" + "b" * 38,
+                state="active",
+            )
+            for index in range(1, 5)
+        ]
+        session.add_all([*accounts, *wallets])
+        session.flush()
+        pending = AccountWalletBinding(
+            social_account_id=accounts[0].id,
+            wallet_id=wallets[0].id,
+            binding_key="pending",
+            state=BindingState.PENDING,
+        )
+        bound = AccountWalletBinding(
+            social_account_id=accounts[1].id,
+            wallet_id=wallets[1].id,
+            binding_key="bound",
+            state=BindingState.BOUND,
+            bound_at=now,
+        )
+        claimed = AccountWalletBinding(
+            social_account_id=accounts[2].id,
+            wallet_id=wallets[2].id,
+            binding_key="claimed",
+            state=BindingState.BOUND,
+            bound_at=now,
+        )
+        session.add_all([pending, bound, claimed])
+        session.flush()
+        session.add_all(
+            [
+                TaskJob(
+                    kind=TaskKind.REPOST,
+                    state=TaskState.SUCCEEDED,
+                    binding_id=bound.id,
+                    social_account_id=bound.social_account_id,
+                    wallet_id=bound.wallet_id,
+                    external_target="fixture",
+                    idempotency_key="repost-ready",
+                    scheduled_at=now,
+                    finished_at=now,
+                ),
+                TaskJob(
+                    kind=TaskKind.REPOST,
+                    state=TaskState.SUCCEEDED,
+                    binding_id=claimed.id,
+                    social_account_id=claimed.social_account_id,
+                    wallet_id=claimed.wallet_id,
+                    external_target="fixture",
+                    idempotency_key="repost-claimed",
+                    scheduled_at=now,
+                    finished_at=now,
+                ),
+                TaskJob(
+                    kind=TaskKind.CLAIM,
+                    state=TaskState.SUCCEEDED,
+                    binding_id=claimed.id,
+                    social_account_id=claimed.social_account_id,
+                    wallet_id=claimed.wallet_id,
+                    external_target="fixture",
+                    idempotency_key="claim-done",
+                    scheduled_at=now,
+                    finished_at=now,
+                ),
+                TaskJob(
+                    kind=TaskKind.REPOST,
+                    state=TaskState.WAITING_EXTERNAL_VALIDATION,
+                    binding_id=bound.id,
+                    social_account_id=bound.social_account_id,
+                    wallet_id=bound.wallet_id,
+                    external_target="fixture",
+                    idempotency_key="repost-waiting",
+                    scheduled_at=now,
+                ),
+                TaskJob(
+                    kind=TaskKind.BIND,
+                    state=TaskState.FAILED,
+                    binding_id=pending.id,
+                    social_account_id=pending.social_account_id,
+                    wallet_id=pending.wallet_id,
+                    external_target="fixture",
+                    idempotency_key="bind-failed",
+                    scheduled_at=now,
+                ),
+            ]
+        )
+        session.flush()
+
+        summary = collect_operations_summary(session, now=now)
+
+    assert summary.resources.accounts_active == 4
+    assert summary.resources.accounts_healthy == 3
+    assert summary.resources.accounts_available_for_binding == 1
+    assert summary.resources.wallets_available_for_binding == 1
+    stages = {stage.key: stage for stage in summary.stages}
+    assert stages["verify"].ready == 4
+    assert stages["bind"].ready == 1
+    assert stages["bind"].waiting == 1
+    assert stages["bind"].failed == 1
+    assert stages["repost"].ready == 2
+    assert stages["repost"].waiting == 1
+    assert stages["claim"].ready == 1

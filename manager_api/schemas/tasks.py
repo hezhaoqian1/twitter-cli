@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -68,6 +69,38 @@ class WorkflowBatchCreateRequest(BaseModel):
     dispatch_limit: int = Field(default=10, ge=1, le=32)
 
 
+class WorkflowStage(str, Enum):
+    """Independent console stage for batch creation."""
+
+    VERIFY = "verify"
+    BIND = "bind"
+    REPOST = "repost"
+    CLAIM = "claim"
+
+
+class WorkflowStageBatchItemRequest(BaseModel):
+    """One row in a stage-oriented batch command."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    social_account_id: UUID | None = None
+    wallet_id: UUID | None = None
+    binding_id: UUID | None = None
+    external_target: str = Field(default="", max_length=512)
+    priority: int = Field(default=0, ge=-100, le=100)
+
+
+class WorkflowStageBatchCreateRequest(BaseModel):
+    """Create one homogeneous stage batch without implicit chaining."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=255)
+    stage: WorkflowStage
+    items: list[WorkflowStageBatchItemRequest] = Field(min_length=1, max_length=500)
+    dispatch_limit: int = Field(default=10, ge=1, le=32)
+
+
 class TaskTransitionRequest(BaseModel):
     """Optional redacted observation for a worker-owned transition."""
 
@@ -115,6 +148,7 @@ class TaskResponse(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     external_operation_ref: str | None = None
+    target_configured: bool
     result_summary: str | None = None
     failure_code: str | None = None
     poll_deadline_at: datetime | None = None

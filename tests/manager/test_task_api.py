@@ -68,6 +68,7 @@ def test_task_api_is_registered_idempotent_and_redacted(session: Session) -> Non
     assert listed.total == 1
     assert "provider.example" not in first.model_dump_json()
     assert "private-target" not in first.model_dump_json()
+    assert first.target_configured is True
     assert first.state == TaskState.QUEUED.value
     assert isinstance(first.id, UUID)
     assert listed.items[0].events[0].to_state == TaskState.QUEUED.value

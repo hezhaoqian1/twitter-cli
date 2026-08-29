@@ -357,3 +357,43 @@ Date: `2026-08-28`
   (`1578 modules transformed`).
 - Through Clash `127.0.0.1:7890`, PostgreSQL returned `SELECT 1` and Redis
   returned `PING=True`; no application data was written.
+
+## Frontend Runtime Verification
+
+- Vite served the manager UI at `http://127.0.0.1:5178/` using the bundled
+  Node runtime.
+- The API was started through `127.0.0.1:7890` with
+  `manager_api.main:create_app --factory`; the module uses an app factory.
+- `/health/ready` returned `{"status":"ok","checks":{"postgres":"ok","redis":"ok"}}`.
+- The Tasks page rendered `API 在线` and returned an empty task page from
+  PostgreSQL without console errors.
+- At 390px width, the mobile Tasks page had equal `390px` document and client
+  widths, confirming no horizontal overflow. The filter panel occupied the
+  available content width.
+- No account credentials, cookies, wallet keys, private keys, or provider
+  connection values were included in this evidence.
+
+## Stage Batch Workflow Evidence
+
+- Added the stage-oriented workflow contract documented in
+  `docs/manager-stage-batches.md`.
+- Added `POST /api/tasks/stages`, with stage values `verify`, `bind`,
+  `repost`, and `claim`.
+- The Accounts page now exposes separate `批量校验` and `批量绑定` actions.
+  Repost and claim remain on confirmed binding rows and selected binding
+  batches.
+- New stage batches use `workflow_type=stage:<name>` and their child tasks do
+  not set `depends_on_task_id`, so a delayed repost validation does not block
+  other operator stages.
+- Synthetic runner acceptance passed with four separate stage batches:
+  `jobs=16`, `bindings_bound=4`, `delayed_reposts_polled=4`, `repost_calls=4`,
+  `claim_calls=4`, and empty ready/processing queues.
+- Focused manager suite passed: `343 passed, 6 deselected, 1 warning`.
+- Fresh checks passed: Ruff for `manager_api`, `scripts`, and `tests/manager`;
+  bundled TypeScript compilation; and Vite production build.
+- Browser QA with mocked API data passed for Overview, Accounts, Verify
+  dialog, Bind dialog, Bindings, and Tasks pages. Screenshots are stored under
+  `artifacts/qa/stage-ui-*.png`.
+- No real account credentials, cookies, tokens, private keys, mnemonics, or
+  Railway connection strings were added to tracked source, tests, screenshots,
+  or evidence.

@@ -45,3 +45,37 @@ class RuntimeMetricsResponse(BaseModel):
     tasks: RuntimeTaskMetrics
     leases: RuntimeLeaseMetrics
     workers: RuntimeWorkerMetrics
+
+
+class OperationResourceCounts(BaseModel):
+    """运营台公开资源计数，不包含任何密钥或会话内容。"""
+
+    accounts_total: int
+    accounts_active: int
+    accounts_healthy: int
+    accounts_available_for_binding: int
+    wallets_total: int
+    wallets_active: int
+    wallets_available_for_binding: int
+    bindings_total: int
+    bindings_pending: int
+    bindings_bound: int
+
+
+class OperationStageSummary(BaseModel):
+    """One independent batch stage and its current actionable count."""
+
+    key: str
+    label: str
+    ready: int
+    waiting: int = 0
+    failed: int = 0
+    detail: str
+
+
+class OperationsSummaryResponse(BaseModel):
+    """Read-only operations command-center summary for staged batch work."""
+
+    generated_at: datetime
+    resources: OperationResourceCounts
+    stages: list[OperationStageSummary]

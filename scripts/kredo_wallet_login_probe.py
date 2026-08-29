@@ -492,6 +492,7 @@ def run(
     claim: bool = False,
     headed: bool = False,
     keep_open: bool = False,
+    status_only: bool = False,
 ) -> dict[str, object]:
     """打开 Kredo，完成钱包登录并诊断 X 绑定状态。"""
     from playwright.sync_api import sync_playwright
@@ -627,7 +628,7 @@ def run(
         final_task_url = ""
         oauth_completion = "not_started"
         repost_result: dict[str, object] | None = None
-        if logged_in and bind_twitter:
+        if logged_in and (bind_twitter or repost or claim or status_only):
             page.goto(KREDO_TASKS, wait_until="networkidle", timeout=60_000)
             page.wait_for_timeout(1000)
             try:
@@ -640,7 +641,7 @@ def run(
                 )
             except Exception:
                 pass
-            if task_modal_opened and not repost:
+            if task_modal_opened and bind_twitter and not repost and not claim and not status_only:
                 # 第二层按钮才会触发 bind API，并同步创建 OAuth popup。
                 bind_label: str | None = None
                 popup = None
@@ -748,7 +749,7 @@ def run(
             callback_result = None
 
         # callback 后通过前端自身加载任务接口，避免跨域 page.evaluate fetch 误判。
-        if logged_in and bind_twitter:
+        if logged_in and (bind_twitter or repost or claim or status_only):
             # 授权 popup 可能在回调后关闭，任务状态始终从主任务页读取。
             status_page = task_page
             # 回调完成后后端和任务卡存在短暂最终一致性，不能只读一次。
@@ -794,7 +795,39 @@ def run(
                 repost_result = {"status": "tweet_url_missing"}
 
         if claim:
-            raise RuntimeError("claim execution is not implemented in this probe")
+            status_page = task_page
+            status_page.goto(KREDO_TASKS, wait_until="domcontentloaded", timeout=60_000)
+            status_page.wait_for_timeout(1200)
+            task_state = _latest_task_state(api_responses) or task_state
+            claim_clicked = _click_first_visible_containing(
+                status_page,
+                (
+                    "領取",
+                    "领取",
+                    "Claim",
+                    "Claim rewards",
+                    "領取獎勵",
+                    "领取奖励",
+                ),
+            )
+            claim_result: dict[str, object]
+            if claim_clicked:
+                # 领取按钮通常只触发后端请求；如页面要求签名，LocalWallet 会拒绝交易类签名。
+                claim_deadline = time.time() + max(10, min(timeout, 90))
+                claim_result = {"status": "pending_claim", "button": claim_clicked}
+                while time.time() < claim_deadline:
+                    status_page.goto(KREDO_TASKS, wait_until="domcontentloaded", timeout=60_000)
+                    status_page.wait_for_timeout(1200)
+                    task_state = _latest_task_state(api_responses) or task_state
+                    current_status = str((task_state or {}).get("status") or "")
+                    if current_status in {"claimed", "complete", "completed"}:
+                        claim_result = {"status": "claimed", "button": claim_clicked}
+                        break
+                    status_page.wait_for_timeout(1500)
+            else:
+                claim_result = {"status": "claim_button_not_found"}
+        else:
+            claim_result = None
 
         screenshot.parent.mkdir(parents=True, exist_ok=True)
         screenshot_page = task_page if page.is_closed() else page
@@ -819,6 +852,7 @@ def run(
                 "callback_result": callback_result,
                 "task_state": task_state,
                 "repost": repost_result,
+                "claim": claim_result,
                 "api_responses": api_responses[-8:],
                 "redirects": redirects[-8:],
                 "oauth_responses": oauth_responses[-8:],
@@ -868,6 +902,7 @@ def main() -> int:
     )
     parser.add_argument("--repost", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--claim", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--status-only", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     private_key = os.environ.get("KREDO_PRIVATE_KEY", "")
@@ -884,6 +919,7 @@ def main() -> int:
         claim=args.claim,
         headed=args.headed,
         keep_open=args.keep_open,
+        status_only=args.status_only,
     )
     if not args.keep_open:
         print(json.dumps(result, ensure_ascii=False, indent=2))

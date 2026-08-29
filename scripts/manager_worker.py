@@ -39,6 +39,7 @@ def build_runner(
     *,
     session,
     redis_client,
+    x_adapter,
     kredo_workflow_factory,
 ) -> TaskRunner:
     """Assemble the production runner from environment-backed dependencies."""
@@ -53,7 +54,7 @@ def build_runner(
     execution = TaskExecutionService(
         session,
         vault=vault,
-        x_adapter=XAdapter(build_twitter_client_factory()),
+        x_adapter=x_adapter,
         kredo_adapter=KredoAdapter(kredo_workflow_factory),
         config=ExecutionConfig(
             poll_delay_seconds=max(1, int(settings.external_poll_interval_seconds)),
@@ -76,6 +77,7 @@ def build_runner(
 def main() -> int:
     """Run until Railway or the local supervisor sends a termination signal."""
     settings = get_settings()
+    x_factory_spec = os.environ.get("MANAGER_X_ADAPTER_FACTORY", "").strip()
     factory_spec = os.environ.get("MANAGER_KREDO_WORKFLOW_FACTORY", "").strip()
     if not factory_spec:
         raise RuntimeError("MANAGER_KREDO_WORKFLOW_FACTORY is required for the worker")
@@ -98,10 +100,15 @@ def main() -> int:
     signal.signal(signal.SIGINT, request_stop)
 
     try:
+        if x_factory_spec:
+            x_adapter = _load_symbol(x_factory_spec)()
+        else:
+            x_adapter = XAdapter(build_twitter_client_factory())
         runner = build_runner(
             settings,
             session=session,
             redis_client=redis_client,
+            x_adapter=x_adapter,
             kredo_workflow_factory=_load_symbol(factory_spec),
         )
         runner.run_forever(

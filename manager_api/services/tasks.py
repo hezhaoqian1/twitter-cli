@@ -198,6 +198,7 @@ class TaskService:
         batch = TaskBatch(
             name=normalized_name,
             kind=kind,
+            workflow_type=f"stage:{kind.value}",
             dispatch_limit=dispatch_limit,
             state="active",
         )
@@ -441,6 +442,24 @@ class TaskService:
         job.next_poll_at = None
         self.session.flush()
         return self.transition(task_id, TaskState.QUEUED, summary="external status poll queued")
+
+    def requeue_due_polls(self, *, now: datetime | None = None) -> int:
+        """将达到轮询时间的外部校验任务自动重新入队。"""
+        current_time = now or utc_now()
+        jobs = self.session.scalars(
+            select(TaskJob)
+            .where(
+                TaskJob.state == TaskState.WAITING_EXTERNAL_VALIDATION,
+                TaskJob.next_poll_at.is_not(None),
+                TaskJob.next_poll_at <= current_time,
+            )
+            .order_by(TaskJob.next_poll_at, TaskJob.created_at, TaskJob.id)
+        ).all()
+        changed = 0
+        for job in jobs:
+            self.poll(job.id)
+            changed += 1
+        return changed
 
     def recover_expired_lease(self, task_id: UUID) -> TaskJob:
         """Requeue a leased or running task after its worker lease expires."""

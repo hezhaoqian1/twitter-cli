@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -12,7 +13,7 @@ from manager_api.adapters.protocol import (
     ExternalStatus,
     OperationMaterial,
 )
-from manager_api.db.base import Base
+from manager_api.db.base import Base, utc_now
 from manager_api.models.accounts import AccountHealth
 from manager_api.models.bindings import AccountWalletBinding, BindingState
 from manager_api.models.tasks import TaskState
@@ -78,7 +79,8 @@ class FakeKredoAdapter:
             evidence=AdapterEvidence("claimed", "synthetic claim complete"),
         )
 
-    def status(self, operation):
+    def status(self, operation, account=None, wallet=None):
+        del account, wallet
         self.status_calls += 1
         return ExternalObservation(
             operation_ref="synthetic-repost",
@@ -211,10 +213,9 @@ def test_execution_service_preserves_delayed_external_state_for_polling() -> Non
         assert x_adapter.repost_calls == 1
         assert kredo_adapter.status_calls == 1
 
-        # 轮询同一个任务时，先把 waiting 任务重新排队，再验证只读路径。
-        from manager_api.services.tasks import TaskService
-
-        TaskService(session).poll(repost.id)
+        # 到达 next_poll_at 后由调度器自动回队，再验证只读路径。
+        repost.next_poll_at = utc_now() - timedelta(seconds=1)
+        session.flush()
         polled = worker.run_one(scheduler.dispatch_once(limit=1)[0], execution.handle)
         assert polled.state is TaskState.WAITING_EXTERNAL_VALIDATION
         assert x_adapter.repost_calls == 1

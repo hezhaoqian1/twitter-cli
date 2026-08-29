@@ -320,7 +320,12 @@ class KredoWorkflowProtocol(Protocol):
     ) -> ExternalPayload:
         """Start one Kredo claim workflow."""
 
-    def status(self, operation: OperationMaterial) -> ExternalPayload:
+    def status(
+        self,
+        operation: OperationMaterial,
+        account: AccountMaterial | None = None,
+        wallet: WalletMaterial | None = None,
+    ) -> ExternalPayload:
         """Read the current external state before replaying an action."""
 
     def account_summary(
@@ -341,5 +346,10 @@ KredoWorkflowFactory: TypeAlias = Callable[
 class ExternalAdapterProtocol(Protocol):
     """Common high-level adapter shape used by the worker layer."""
 
-    def status(self, operation: OperationMaterial) -> ExternalObservation:
+    def status(
+        self,
+        operation: OperationMaterial,
+        account: AccountMaterial | None = None,
+        wallet: WalletMaterial | None = None,
+    ) -> ExternalObservation:
         """Read one normalized external operation state."""
