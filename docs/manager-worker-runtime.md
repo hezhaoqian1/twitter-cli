@@ -46,6 +46,8 @@ BROWSER_CONCURRENCY
 MANAGER_KREDO_BROWSER_TIMEOUT_SECONDS
 MANAGER_KREDO_BROWSER_ARTIFACT_DIR
 MANAGER_KREDO_BROWSER_HEADED
+KREDO_BROWSER_PROXY
+KREDO_BROWSER_CHANNEL
 WORKER_LEASE_TTL_SECONDS
 WORKER_RECOVERY_INTERVAL_SECONDS
 WORKER_HEARTBEAT_INTERVAL_SECONDS
@@ -70,17 +72,35 @@ process through the child environment, and starts
 `scripts/kredo_wallet_login_probe.py` with:
 
 ```text
---headed --keep-open --no-bind-twitter --no-wait-task-state --repost
+--headed --keep-open --no-bind-twitter --no-wait-task-state
 ```
 
 The bulk endpoint accepts at most 10 binding ids per request. Each id becomes
 one independent browser process and one isolated browser context, so a slow
 Kredo page does not block the other selected rows.
 
+The headed workbench has two browser tabs with different responsibilities:
+
+- The main tab stays on Kredo's task page for manual X binding, task refresh,
+  and reward claiming.
+- When the operator clicks Kredo's manual `前往 X` action, the OAuth X tab is
+  opened or repaired from `about:blank` and remains open for manual binding
+  and reposting. The workbench does not click repost or close the tab.
+
+When the operator later clicks Kredo's manual X-binding action, Kredo may
+create an `about:blank` popup before its bind API returns `authorizeUrl`. The
+probe watches both events and navigates that same popup to X as soon as both
+pieces are available. The repaired OAuth popup stays open for the operator.
+
+`KREDO_BROWSER_PROXY` configures the browser network path independently from
+the PostgreSQL/Redis Clash tunnel. Set it to
+`http://127.0.0.1:7890` when the local network requires Clash. Existing
+browser processes must be closed and relaunched after changing it.
+
 For local use, the endpoint can unlock the Vault from `WORKER_VAULT_PASSWORD`
 when the UI Vault session is locked. Keep that value only in `.env.manager` or
 the server secret store. The HTTP response is intentionally public-only:
-binding id, process id, screenshot path, and repost target.
+binding id, process id, and screenshot path.
 
 `MANAGER_KREDO_WORKFLOW_FACTORY` is the bridge between the durable task
 system and the browser workflow that was proven manually. The built-in factory

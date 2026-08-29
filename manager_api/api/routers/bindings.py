@@ -142,7 +142,6 @@ def _workbench_response(item: ManualWorkbenchLaunch) -> ManualWorkbenchLaunchRes
         binding_id=item.binding_id,
         process_id=item.process_id,
         screenshot=item.screenshot,
-        repost_target=item.repost_target,
     )
 
 
@@ -198,12 +197,11 @@ def launch_manual_workbench(
     session: Session = Depends(get_db),
     vault: VaultService = Depends(get_vault),
 ) -> ManualWorkbenchResponse:
-    """Launch one headed browser with X cookies, wallet provider, and repost prep."""
+    """Launch one headed browser with X cookies, wallet provider, and manual X flow."""
     _unlock_for_local_workbench(request, vault)
     try:
         launch = ManualWorkbenchService(session, vault).launch(
             binding_id,
-            repost_target=request_body.repost_target,
             timeout_seconds=request_body.timeout_seconds,
         )
     except BindingError as exc:
@@ -227,7 +225,6 @@ def launch_manual_workbenches(
     try:
         launches = ManualWorkbenchService(session, vault).launch_many(
             request_body.binding_ids,
-            repost_target=request_body.repost_target,
             limit=request_body.limit,
             timeout_seconds=request_body.timeout_seconds,
         )

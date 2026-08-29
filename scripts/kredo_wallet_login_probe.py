@@ -9,7 +9,7 @@ import os
 import re
 import sys
 import time
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlsplit, urlunparse
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,7 @@ SENSITIVE_QUERY_KEYS = {
     "oauth_verifier",
 }
 OAUTH_CALLBACK_PATH = "/api/v1/tasks/twitter/callback"
+DEFAULT_STEP_DELAY_MS = 1_000
 
 
 def _decode_personal_sign_message(value: object) -> str:
@@ -264,10 +265,18 @@ def _load_x_cookies(path: Path) -> list[dict[str, object]]:
     return cookies
 
 
+def _wait_step(page: Any, delay_ms: int = DEFAULT_STEP_DELAY_MS) -> None:
+    """每个关键浏览器动作后留出固定间隔，降低短时间请求峰值。"""
+    page.wait_for_timeout(delay_ms)
+
+
 def _launch_chromium(playwright: Any, *, headed: bool) -> Any:
     """优先使用本机 Chrome，失败时回退到 Playwright 管理的 Chromium。"""
     channel = os.environ.get("KREDO_BROWSER_CHANNEL", "chrome").strip()
-    launch_options = {"headless": not headed}
+    launch_options: dict[str, Any] = {"headless": not headed}
+    proxy = _browser_proxy_settings()
+    if proxy is not None:
+        launch_options["proxy"] = proxy
     if channel:
         try:
             return playwright.chromium.launch(channel=channel, **launch_options)
@@ -277,16 +286,36 @@ def _launch_chromium(playwright: Any, *, headed: bool) -> Any:
     return playwright.chromium.launch(**launch_options)
 
 
+def _browser_proxy_settings() -> dict[str, str] | None:
+    """读取浏览器专用代理配置，避免把 API 隧道误当成浏览器代理。"""
+    value = os.environ.get("KREDO_BROWSER_PROXY", "").strip()
+    if not value:
+        return None
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https", "socks5"} or not parsed.hostname:
+        raise ValueError("KREDO_BROWSER_PROXY must be a valid HTTP(S) or SOCKS5 proxy URL")
+    default_port = 443 if parsed.scheme == "https" else 80
+    server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or default_port}"
+    settings = {"server": server}
+    if parsed.username:
+        settings["username"] = parsed.username
+    if parsed.password:
+        settings["password"] = parsed.password
+    return settings
+
+
 def _click_first_visible(page: Any, labels: tuple[str, ...]) -> str | None:
     """点击第一个可见的授权按钮，并返回匹配到的文字。"""
     for label in labels:
         locator = page.get_by_role("button", name=label, exact=True)
         if locator.count() and locator.first.is_visible():
             locator.first.click(timeout=5000)
+            _wait_step(page)
             return label
         text = page.get_by_text(label, exact=True)
         if text.count() and text.first.is_visible():
             text.first.click(timeout=5000)
+            _wait_step(page)
             return label
     return None
 
@@ -297,15 +326,18 @@ def _click_first_visible_containing(page: Any, labels: tuple[str, ...]) -> str |
         locator = page.get_by_role("button", name=label, exact=False)
         if locator.count() and locator.first.is_visible():
             locator.first.click(timeout=5000)
+            _wait_step(page)
             return label
         # X 的授权页在有头模式下可能先渲染普通 button，再补充可访问性名称。
         button = page.locator("button").filter(has_text=label)
         if button.count() and button.first.is_visible():
             button.first.click(timeout=5000)
+            _wait_step(page)
             return label
         text = page.get_by_text(label, exact=True)
         if text.count() and text.first.is_visible():
             text.first.click(timeout=5000)
+            _wait_step(page)
             return label
     return None
 
@@ -341,7 +373,8 @@ def _open_task_modal(page: Any) -> bool:
         return (
             _click_first_visible(
                 page,
-                ("去完成", "前往 X", "Go to X", "Start"),
+                # 只匹配任务卡的第一层入口，不能误点弹窗内部的 X 操作按钮。
+                ("去完成", "Start"),
             )
             is not None
         )
@@ -439,6 +472,7 @@ def _repost_tweet(page: Any, tweet_url: str, timeout_ms: int = 30_000) -> dict[s
         return {"status": "invalid_tweet_url", "tweet_url": tweet_url}
 
     page.goto(tweet_url, wait_until="domcontentloaded", timeout=60_000)
+    _wait_step(page)
     deadline = time.time() + timeout_ms / 1000
     initial_state = "unknown"
     while time.time() < deadline:
@@ -463,6 +497,7 @@ def _repost_tweet(page: Any, tweet_url: str, timeout_ms: int = 30_000) -> dict[s
         '[data-testid="retweet"], [aria-label="Repost"], [aria-label="Retweet"]'
     ).first
     button.click(timeout=5_000)
+    _wait_step(page)
     menu_deadline = time.time() + min(timeout_ms, 10_000) / 1000
     clicked_menu = False
     while time.time() < menu_deadline:
@@ -471,11 +506,13 @@ def _repost_tweet(page: Any, tweet_url: str, timeout_ms: int = 30_000) -> dict[s
             if menu_item.count() and menu_item.first.is_visible():
                 menu_item.first.click(timeout=5_000)
                 clicked_menu = True
+                _wait_step(page)
                 break
             text = page.get_by_text(label, exact=True)
             if text.count() and text.first.is_visible():
                 text.first.click(timeout=5_000)
                 clicked_menu = True
+                _wait_step(page)
                 break
         if clicked_menu:
             break
@@ -501,6 +538,44 @@ def _repost_tweet(page: Any, tweet_url: str, timeout_ms: int = 30_000) -> dict[s
         "tweet_id": tweet_id,
         "tweet_url": tweet_url,
     }
+
+
+def _repost_in_temporary_page(
+    context: Any,
+    tweet_url: str,
+    attach_page_diagnostics: Any,
+    timeout_ms: int = 30_000,
+) -> dict[str, object]:
+    """在临时标签页完成转发，结束后无论成功失败都关闭该标签页。"""
+    repost_page = context.new_page()
+    attach_page_diagnostics(repost_page)
+    try:
+        return _repost_tweet(repost_page, tweet_url, timeout_ms=timeout_ms)
+    finally:
+        if not repost_page.is_closed():
+            repost_page.close()
+
+
+def _repair_blank_oauth_popup(
+    context: Any,
+    authorize_urls: list[str],
+    oauth_pages: list[Any],
+) -> None:
+    """把手动绑定产生的空白弹窗补导航到 X 授权页。"""
+    if not authorize_urls:
+        return
+    authorize_url = authorize_urls[-1]
+    for candidate in context.pages:
+        if candidate.is_closed() or candidate.url != "about:blank":
+            continue
+        if candidate not in oauth_pages:
+            oauth_pages.append(candidate)
+        try:
+            candidate.goto(authorize_url, wait_until="domcontentloaded", timeout=60_000)
+            _wait_step(candidate)
+        except Exception:
+            # 弹窗可能正处于创建或关闭过程中，下一轮继续尝试。
+            continue
 
 
 class LocalWallet:
@@ -610,9 +685,14 @@ def run(
         page_errors: list[str] = []
         navigation_events: list[dict[str, str]] = []
         request_failures: list[dict[str, str]] = []
+        attached_page_ids: set[int] = set()
 
         def attach_page_diagnostics(target: Any) -> None:
             """为主页面和 OAuth popup 统一记录导航与请求失败。"""
+            target_id = id(target)
+            if target_id in attached_page_ids:
+                return
+            attached_page_ids.add(target_id)
             target.on(
                 "framenavigated",
                 lambda frame: (
@@ -630,6 +710,13 @@ def run(
                     }
                 ),
             )
+
+        def on_page_created(target: Any) -> None:
+            """记录新标签页，并在授权地址已返回时立即修复空白 OAuth 页。"""
+            attach_page_diagnostics(target)
+            if target.url == "about:blank" and target not in oauth_pages:
+                oauth_pages.append(target)
+            _repair_blank_oauth_popup(context, bind_authorize_urls, oauth_pages)
 
         def on_response(response: Any) -> None:
             """采集 API 与 OAuth callback 响应，避免依赖页面内部 fetch。"""
@@ -663,6 +750,8 @@ def run(
                         raw_authorize_url = raw_data.get("authorizeUrl")
                         if isinstance(raw_authorize_url, str) and raw_authorize_url:
                             bind_authorize_urls.append(raw_authorize_url)
+                            # Kredo 可能先开空白页再返回接口；地址到达后立即补导航。
+                            _repair_blank_oauth_popup(context, bind_authorize_urls, oauth_pages)
             if "/api/v1/tasks/twitter/callback" in url:
                 headers = response.headers
                 redirects.append(
@@ -676,7 +765,7 @@ def run(
 
         # OAuth 可能在新标签页完成；监听整个 context 才不会漏掉 bind/callback。
         context.on("response", on_response)
-        context.on("page", attach_page_diagnostics)
+        context.on("page", on_page_created)
         attach_page_diagnostics(page)
         page.on(
             "console",
@@ -687,9 +776,11 @@ def run(
         page.on("pageerror", lambda error: page_errors.append(str(error)[:240]))
 
         page.goto(KREDO_HOME, wait_until="networkidle", timeout=60_000)
+        _wait_step(page)
         page.get_by_text("登錄", exact=True).click()
         page.wait_for_timeout(2500)
         page.get_by_text("MetaMask", exact=True).click()
+        _wait_step(page)
 
         deadline = time.time() + timeout
         body = ""
@@ -790,6 +881,7 @@ def run(
                     oauth_navigation_fallback = True
                     if page.url == "about:blank":
                         page.goto(authorize_url, wait_until="domcontentloaded", timeout=60_000)
+                        _wait_step(page)
                         oauth_popup_opened = True
                 popup_url = page.url
                 if authorize_url:
@@ -876,18 +968,21 @@ def run(
                     status_page.wait_for_timeout(1000)
 
         if logged_in and repost:
-            # 绑定完成后只读取官方推文并执行一次转发，避免重复转发。
+            # 主标签页保持 Kredo 任务页；转发使用临时标签页，完成后立即关闭。
             tweet_url = repost_target.strip() or str((task_state or {}).get("tweetUrl") or "")
             status_page = task_page
             if not tweet_url:
-                status_page.goto(KREDO_TASKS, wait_until="domcontentloaded", timeout=60_000)
-                status_page.wait_for_timeout(1500)
                 task_state = _read_task_state(status_page, api_responses) or task_state
                 tweet_url = str((task_state or {}).get("tweetUrl") or "")
                 if not tweet_url:
                     tweet_url = _find_tweet_url(status_page)
             if tweet_url:
-                repost_result = _repost_tweet(status_page, tweet_url)
+                repost_result = _repost_in_temporary_page(
+                    context,
+                    tweet_url,
+                    attach_page_diagnostics,
+                    timeout_ms=30_000,
+                )
                 # Kredo 校验也有异步延迟，回到任务页等待最终状态。
                 verify_deadline = time.time() + max(10, min(timeout, 90))
                 while wait_for_task_state and time.time() < verify_deadline:
@@ -906,9 +1001,11 @@ def run(
 
         if logged_in and headed and keep_open and not claim:
             # 半自动工作台最终停在 Kredo 任务页，方便人工绑定或领取。
-            task_page.goto(KREDO_TASKS, wait_until="domcontentloaded", timeout=60_000)
-            task_page.wait_for_timeout(1200)
-            task_modal_opened = _open_task_modal(task_page) or task_modal_opened
+            if not task_page.url.startswith(KREDO_TASKS):
+                task_page.goto(KREDO_TASKS, wait_until="domcontentloaded", timeout=60_000)
+                task_page.wait_for_timeout(1200)
+            if not task_modal_opened:
+                task_modal_opened = _open_task_modal(task_page)
             task_state = _read_task_state(task_page, api_responses) or task_state
 
         if claim:
@@ -983,6 +1080,8 @@ def run(
             # 有头验证结束后保留浏览器，方便人工确认最终奖励页状态。
             print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
             while any(not candidate.is_closed() for candidate in context.pages):
+                # 手动点击绑定时，Kredo 可能先创建 about:blank，再异步返回授权地址。
+                _repair_blank_oauth_popup(context, bind_authorize_urls, oauth_pages)
                 time.sleep(1)
         context.close()
 

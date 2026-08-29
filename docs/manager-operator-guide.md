@@ -195,18 +195,27 @@ to 10 at a time. Each process:
 1. loads the selected row's imported X Cookie into an isolated browser context;
 2. injects the selected row's wallet private key as the local wallet provider;
 3. opens Kredo's task page;
-4. submits or confirms the fixed X repost target;
-5. leaves the browser open on the Kredo task page/modal for manual binding and
-   claiming.
+4. leaves the main browser tab on the Kredo task page/modal;
+5. when you click Kredo's `前往 X`, opens the X page in a separate tab and
+   keeps that tab open for your manual binding and repost actions.
 
-The default repost target is:
+The workbench does not automatically bind X or claim rewards. Binding and
+claiming remain manual after the wallet connection is ready.
 
-```text
-https://x.com/Kredofun/status/2092911885209444742
-```
+The browser uses two tabs with separate responsibilities:
 
-The response only includes the binding id, local browser process id,
-screenshot path, and repost target. It does not return account passwords,
+- Main Kredo tab: remains open for manual `前往 X`, wallet confirmation,
+  binding, task refresh, and reward claim.
+- X tab: is opened by Kredo's manual `前往 X` action and remains open. The
+  operator completes the X binding and repost manually, then closes it when
+  finished.
+
+If Kredo creates an OAuth tab at `about:blank`, the workbench waits for the
+authorization URL returned by Kredo and navigates that same tab to X. The tab
+stays open for the operator; the workbench does not repost or close it.
+
+The response only includes the binding id, local browser process id, and
+screenshot path. It does not return account passwords,
 TOTP seeds, email passwords, tokens, cookies, private keys, or mnemonics.
 
 Use this mode in waves:

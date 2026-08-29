@@ -5,8 +5,10 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,9 +24,28 @@ from ..models.wallets import WalletSecret
 from .bindings import BindingNotFoundError, BindingService
 from .vault import VaultService
 
-DEFAULT_REPOST_TARGET = "https://x.com/Kredofun/status/2092911885209444742"
 WINDOWS_CREATE_NEW_PROCESS_GROUP = 0x00000200
-WINDOWS_DETACHED_PROCESS = 0x00000008
+WINDOWS_CREATE_NO_WINDOW = 0x08000000
+WORKBENCH_LAUNCH_INTERVAL_SECONDS = 1.0
+
+
+def _resolve_uv_executable() -> str:
+    """解析后台工作台子进程需要的 uv 可执行文件路径。"""
+    configured = os.environ.get("UV_EXECUTABLE", "").strip()
+    if configured:
+        return configured
+
+    resolved = shutil.which("uv")
+    if resolved:
+        return resolved
+
+    if os.name == "nt":
+        user_uv = Path.home() / ".local" / "bin" / "uv.exe"
+        if user_uv.is_file():
+            return str(user_uv)
+
+    # 让非 Windows 环境继续依赖系统 PATH，并保留原有错误信息。
+    return "uv"
 
 
 def _detached_process_kwargs() -> dict[str, Any]:
@@ -36,7 +57,7 @@ def _detached_process_kwargs() -> dict[str, Any]:
                 "CREATE_NEW_PROCESS_GROUP",
                 WINDOWS_CREATE_NEW_PROCESS_GROUP,
             )
-            | getattr(subprocess, "DETACHED_PROCESS", WINDOWS_DETACHED_PROCESS)
+            | getattr(subprocess, "CREATE_NO_WINDOW", WINDOWS_CREATE_NO_WINDOW)
         }
     return {"start_new_session": True}
 
@@ -48,7 +69,6 @@ class ManualWorkbenchLaunch:
     binding_id: UUID
     process_id: int
     screenshot: str
-    repost_target: str
 
 
 class ManualWorkbenchService:
@@ -62,10 +82,9 @@ class ManualWorkbenchService:
         self,
         binding_id: UUID,
         *,
-        repost_target: str = DEFAULT_REPOST_TARGET,
         timeout_seconds: int = 45,
     ) -> ManualWorkbenchLaunch:
-        """启动一个半自动浏览器：预置 X Cookie、钱包并自动转发固定推文。"""
+        """启动工作台：主页面停在 Kredo，X 页面由操作员手动打开并保留。"""
         account, wallet = self._materials(binding_id)
         repo_root = Path(__file__).resolve().parents[2]
         workdir = Path(tempfile.mkdtemp(prefix="kredo-manual-workbench-"))
@@ -83,7 +102,7 @@ class ManualWorkbenchService:
             "KREDO_PRIVATE_KEY": wallet.private_key,
         }
         command = [
-            "uv",
+            _resolve_uv_executable(),
             "run",
             "--with",
             "playwright",
@@ -95,9 +114,6 @@ class ManualWorkbenchService:
             "--keep-open",
             "--no-bind-twitter",
             "--no-wait-task-state",
-            "--repost",
-            "--repost-target",
-            repost_target.strip() or DEFAULT_REPOST_TARGET,
             "--twitter-cookie-file",
             str(cookie_file),
             "--screenshot",
@@ -118,14 +134,12 @@ class ManualWorkbenchService:
             binding_id=binding_id,
             process_id=process.pid,
             screenshot=str(screenshot),
-            repost_target=repost_target.strip() or DEFAULT_REPOST_TARGET,
         )
 
     def launch_many(
         self,
         binding_ids: list[UUID],
         *,
-        repost_target: str = DEFAULT_REPOST_TARGET,
         limit: int = 10,
         timeout_seconds: int = 45,
     ) -> list[ManualWorkbenchLaunch]:
@@ -135,14 +149,17 @@ class ManualWorkbenchService:
         if limit > 10:
             raise ValueError("limit must be at most 10")
         launches: list[ManualWorkbenchLaunch] = []
-        for binding_id in binding_ids[:limit]:
+        selected_binding_ids = binding_ids[:limit]
+        for index, binding_id in enumerate(selected_binding_ids):
             launches.append(
                 self.launch(
                     binding_id,
-                    repost_target=repost_target,
                     timeout_seconds=timeout_seconds,
                 )
             )
+            if index + 1 < len(selected_binding_ids):
+                # 批量启动之间留出间隔，避免多个浏览器同时访问 Kredo。
+                time.sleep(WORKBENCH_LAUNCH_INTERVAL_SECONDS)
         return launches
 
     def _materials(self, binding_id: UUID) -> tuple[AccountMaterial, WalletMaterial]:

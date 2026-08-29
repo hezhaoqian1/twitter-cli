@@ -46,7 +46,6 @@ export type ManualWorkbenchResult = {
     binding_id: string;
     process_id: number;
     screenshot: string;
-    repost_target: string;
   }>;
 };
 
@@ -543,7 +542,6 @@ export const api = {
     }),
   launchManualWorkbench: (input: {
     binding_ids: string[];
-    repost_target: string;
     limit: number;
     timeout_seconds: number;
   }) =>
@@ -554,7 +552,6 @@ export const api = {
   launchOneManualWorkbench: (
     bindingId: string,
     input: {
-      repost_target: string;
       timeout_seconds: number;
     }
   ) =>

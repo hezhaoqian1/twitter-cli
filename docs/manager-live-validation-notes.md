@@ -62,17 +62,22 @@ operator flow. The working product direction is semi-automatic:
 2. the binding page creates immutable account-wallet rows;
 3. `打开工作台` launches up to 10 headed browsers at a time;
 4. each browser is preloaded with the row's X Cookie and wallet provider;
-5. the browser submits or confirms the fixed repost target;
-6. the operator manually finishes Kredo binding and claim in the headed page.
+5. the main tab stays on Kredo's task page;
+6. the operator clicks Kredo's `前往 X`, completes X binding and reposting in
+   the separate X tab, and closes that tab when finished;
+7. the operator manually finishes Kredo task refresh and claim in the main tab.
 
 The next real run should focus on workbench validation:
 
 1. Start one workbench from the binding page and confirm it opens Kredo with
    the expected X and wallet state.
-2. Confirm the fixed repost target is submitted or already present.
-3. Complete the Kredo binding manually in the headed page.
-4. Refresh the manager binding page or run read-only sync after Kredo updates.
-5. Scale the same action to a wave of up to 10 browser windows.
+2. Click Kredo's `前往 X` and confirm the X tab opens, stays open, and leaves
+   reposting to the operator.
+3. Click the Kredo modal's manual X-binding action and confirm an
+   `about:blank` popup is redirected to the X authorization page.
+4. Complete the Kredo binding manually in the main tab.
+5. Refresh the manager binding page or run read-only sync after Kredo updates.
+6. Scale the same action to a wave of up to 10 browser windows.
 
 The synthetic acceptance path already proves the manager can execute
 independent stage batches through bind, delayed repost polling, and claim when

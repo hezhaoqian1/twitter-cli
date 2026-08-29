@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
@@ -21,7 +22,7 @@ from manager_api.models.accounts import SocialAccount
 from manager_api.schemas.bindings import ManualWorkbenchRequest
 from manager_api.services.bindings import BindingService
 from manager_api.services.imports import AccountImportService
-from manager_api.services.manual_workbench import DEFAULT_REPOST_TARGET, ManualWorkbenchService
+from manager_api.services.manual_workbench import ManualWorkbenchService
 from manager_api.services.vault import VaultRuntime, VaultService
 from manager_api.services.wallets import WalletService
 
@@ -137,20 +138,37 @@ def test_manual_workbench_service_launches_headed_process_without_returning_secr
         )
 
     assert launch.process_id == 4242
-    assert launch.repost_target == DEFAULT_REPOST_TARGET
     assert launch.binding_id == binding_id
     assert PRIVATE_KEY_SECRET not in json.dumps(launch.__dict__, default=str)
     call = FakePopen.calls[0]
     command = call["command"]
-    assert command[:6] == ["uv", "run", "--with", "playwright", "--with", "eth-account"]
+    assert Path(command[0]).stem.lower() == "uv"
+    assert command[1:6] == ["run", "--with", "playwright", "--with", "eth-account"]
     assert "--headed" in command
     assert "--keep-open" in command
     assert "--no-bind-twitter" in command
     assert "--no-wait-task-state" in command
-    assert "--repost" in command
-    assert command[command.index("--repost-target") + 1] == DEFAULT_REPOST_TARGET
+    assert "--repost" not in command
+    assert "--repost-target" not in command
     assert call["env"]["KREDO_PRIVATE_KEY"] == PRIVATE_KEY_SECRET
     assert call["cwd"].name == "twitter-cli"
+
+
+def test_manual_workbench_resolves_uv_from_windows_user_bin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Windows 后台 API 没有继承 PATH 时仍能找到 uv。"""
+    from manager_api.services import manual_workbench
+
+    uv_path = tmp_path / ".local" / "bin" / "uv.exe"
+    uv_path.parent.mkdir(parents=True)
+    uv_path.write_bytes(b"fixture")
+    monkeypatch.setattr(manual_workbench.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(manual_workbench.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(manual_workbench.os, "name", "nt", raising=False)
+
+    assert manual_workbench._resolve_uv_executable() == str(uv_path)
 
 
 def test_manual_workbench_service_rejects_more_than_ten() -> None:
@@ -164,17 +182,38 @@ def test_manual_workbench_service_rejects_more_than_ten() -> None:
             service.launch_many([], limit=11)
 
 
+def test_manual_workbench_bulk_launch_waits_between_processes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """批量工作台启动之间会等待一秒，降低外部请求峰值。"""
+    from manager_api.services import manual_workbench
+
+    engine = _engine()
+    Base.metadata.create_all(engine)
+    runtime = VaultRuntime(cache_ttl_seconds=60)
+    with Session(engine) as session:
+        binding_id = _seed_binding(session, runtime)
+        service = ManualWorkbenchService(session, VaultService(session, runtime=runtime))
+        monkeypatch.setattr(service, "launch", lambda *args, **kwargs: None)
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(manual_workbench.time, "sleep", sleep_calls.append)
+
+        service.launch_many([binding_id, binding_id], limit=2)
+
+    assert sleep_calls == [manual_workbench.WORKBENCH_LAUNCH_INTERVAL_SECONDS]
+
+
 def test_manual_workbench_detaches_process_with_windows_flags(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Windows 本地运行时使用 creationflags 分离有头浏览器。"""
+    """Windows 本地运行时隐藏终端，同时保留有头浏览器窗口。"""
     from manager_api.services import manual_workbench
 
     monkeypatch.setattr(manual_workbench.os, "name", "nt", raising=False)
 
     kwargs = manual_workbench._detached_process_kwargs()
 
-    assert kwargs == {"creationflags": 0x00000208}
+    assert kwargs == {"creationflags": 0x08000200}
 
 
 def test_manual_workbench_detaches_process_with_posix_session(
@@ -217,7 +256,6 @@ def test_manual_workbench_api_bulk_launch_uses_env_unlock_and_redacts_secrets(
         response = launch_manual_workbenches(
             ManualWorkbenchRequest(
                 binding_ids=[binding_id],
-                repost_target=DEFAULT_REPOST_TARGET,
                 limit=10,
                 timeout_seconds=30,
             ),

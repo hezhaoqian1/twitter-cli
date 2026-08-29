@@ -67,6 +67,8 @@ MANAGER_KREDO_WORKFLOW_FACTORY=manager_api.adapters.kredo_browser_workflow:kredo
 MANAGER_KREDO_BROWSER_ARTIFACT_DIR=artifacts/kredo-worker
 MANAGER_KREDO_BROWSER_TIMEOUT_SECONDS=120
 MANAGER_KREDO_BROWSER_HEADED=false
+KREDO_BROWSER_PROXY=http://127.0.0.1:7890
+KREDO_BROWSER_CHANNEL=chrome
 WORKER_CONCURRENCY=3
 BROWSER_CONCURRENCY=2
 ```
@@ -74,6 +76,10 @@ BROWSER_CONCURRENCY=2
 If the provider gives you password-bearing database or Redis connection
 strings, place those full values only in `.env.manager`. Keep tracked docs and
 examples in the redacted form above.
+
+`KREDO_BROWSER_PROXY` is used by the headed browser itself. Set it to the
+Clash HTTP port when X or another external page is blank or slow. The API's
+database tunnel and the browser proxy are separate settings.
 
 If the Vault already exists, use the same `WORKER_VAULT_PASSWORD` that was used
 to initialize it. Keep the recovery key in your password manager or offline
@@ -152,17 +158,26 @@ The workbench is the current primary path for Kredo binding and claiming.
 
 The API starts one independent headed browser process per selected row. Each
 process loads that row's X Cookie, injects that row's wallet provider, opens
-Kredo, submits or confirms the fixed repost target, and stays open for manual
-binding or claiming.
+Kredo's task page, and stays open for manual binding and claiming. When you
+click Kredo's `前往 X`, the X page opens in a separate tab and remains open for
+you to complete binding and reposting manually.
 
-Default repost target:
+The workbench does not automatically bind X or claim rewards. Binding and
+claiming remain manual after the wallet connection is ready.
 
-```text
-https://x.com/Kredofun/status/2092911885209444742
-```
+The two tabs have different jobs:
 
-The API response only contains binding id, process id, screenshot path, and
-repost target. It does not return X cookies, tokens, passwords, TOTP seeds,
+- Main tab: stays on the Kredo task page so you can click `前往 X`, complete
+  binding, refresh the task state, and claim manually.
+- X tab: is opened by the manual Kredo action and stays open. Complete the X
+  binding and repost manually, then close the tab yourself.
+
+If Kredo first creates an `about:blank` OAuth tab, leave the modal open for a
+moment. The workbench waits for Kredo's authorization URL and navigates that
+same tab to X. That tab remains open for manual binding and reposting.
+
+The API response only contains binding id, process id, and screenshot path. It
+does not return X cookies, tokens, passwords, TOTP seeds,
 private keys, or mnemonics.
 
 ## Optional Worker
@@ -217,6 +232,12 @@ If Playwright reports that Chromium is missing, run:
 ```powershell
 uv run playwright install chromium
 ```
+
+If a headed browser shows `about:blank` after clicking `前往 X`, check that
+`.env.manager` contains `KREDO_BROWSER_PROXY=http://127.0.0.1:7890` when your
+network requires Clash, then restart the API before launching a new workbench.
+Existing browser processes keep their original environment and must be closed
+and started again.
 
 If Railway access requires a local HTTP proxy, start the API through the tunnel:
 

@@ -71,7 +71,6 @@ const pageMeta: Array<{ key: PageKey; label: string; icon: typeof Activity }> = 
 ];
 
 const RESOURCE_CACHE_TTL_MS = 30_000;
-const DEFAULT_REPOST_TARGET = "https://x.com/Kredofun/status/2092911885209444742";
 const WORKBENCH_LIMIT = 10;
 
 type ResourceCacheEntry<T> = {
@@ -1406,7 +1405,6 @@ function BindingsPage({
     try {
       const result = await api.launchManualWorkbench({
         binding_ids: bindingIds.slice(0, WORKBENCH_LIMIT),
-        repost_target: DEFAULT_REPOST_TARGET,
         limit: Math.min(bindingIds.length, WORKBENCH_LIMIT),
         timeout_seconds: 45
       });
@@ -1427,7 +1425,7 @@ function BindingsPage({
             <Button
               onClick={() => void launchWorkbench(selected)}
               disabled={selected.length === 0 || launchingWorkbench}
-              title={selected.length === 0 ? "先选择至少一个绑定" : "打开有头浏览器，预置 X Cookie 和钱包，并自动转发固定推文"}
+              title={selected.length === 0 ? "先选择至少一个绑定" : "打开有头浏览器，预置 X Cookie 和钱包，X 页面保持打开供手动操作"}
             >
               {launchingWorkbench ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}
               {workbenchButtonLabel}
@@ -1574,7 +1572,7 @@ function BindingsPage({
                         <Button
                           disabled={!selectable || launchingWorkbench}
                           onClick={() => void launchWorkbench([binding.id])}
-                          title="打开有头浏览器，预置 X Cookie 和钱包，并自动转发固定推文"
+                          title="打开有头浏览器，预置 X Cookie 和钱包，X 页面保持打开供手动操作"
                         >
                           {launchingWorkbench ? <LoaderCircle className="spin" size={14} /> : <Play size={14} />}
                           工作台

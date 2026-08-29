@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _load_module():
     path = Path("scripts/kredo_wallet_login_probe.py")
@@ -242,6 +244,109 @@ def test_oauth_authorize_not_completed_is_a_distinct_completion_code() -> None:
     }
 
 
+def test_wait_step_uses_one_second_default_delay() -> None:
+    mod = _load_module()
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.delays: list[int] = []
+
+        def wait_for_timeout(self, delay_ms: int) -> None:
+            self.delays.append(delay_ms)
+
+    page = FakePage()
+    mod._wait_step(page)
+
+    assert page.delays == [1000]
+
+
+def test_browser_proxy_settings_reads_http_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("KREDO_BROWSER_PROXY", "http://proxy.example:7890")
+
+    assert mod._browser_proxy_settings() == {
+        "server": "http://proxy.example:7890",
+    }
+
+
+def test_browser_proxy_settings_keeps_proxy_credentials_separate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("KREDO_BROWSER_PROXY", "http://user:pass@proxy.example:7890")
+
+    assert mod._browser_proxy_settings() == {
+        "server": "http://proxy.example:7890",
+        "username": "user",
+        "password": "pass",
+    }
+
+
+def test_launch_chromium_passes_browser_proxy_to_playwright(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("KREDO_BROWSER_PROXY", "http://proxy.example:7890")
+
+    class FakeChromium:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def launch(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return object()
+
+    class FakePlaywright:
+        def __init__(self) -> None:
+            self.chromium = FakeChromium()
+
+    playwright = FakePlaywright()
+
+    mod._launch_chromium(playwright, headed=True)
+
+    assert playwright.chromium.calls == [
+        {
+            "channel": "chrome",
+            "headless": False,
+            "proxy": {"server": "http://proxy.example:7890"},
+        }
+    ]
+
+
+def test_open_task_modal_does_not_click_inner_x_action() -> None:
+    """任务弹窗已打开时，不应把内部的前往 X 当成第二次入口。"""
+    mod = _load_module()
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.lookups: list[str] = []
+
+        def get_by_role(self, role: str, name: str, exact: bool):
+            del role, exact
+            self.lookups.append(name)
+            return _InvisibleLocator()
+
+        def get_by_text(self, label: str, exact: bool):
+            del exact
+            self.lookups.append(label)
+            return _InvisibleLocator()
+
+    class _InvisibleLocator:
+        first = None
+
+        def count(self) -> int:
+            return 0
+
+        def is_visible(self) -> bool:
+            return False
+
+    page = FakePage()
+
+    assert mod._open_task_modal(page) is False
+    assert "前往 X" not in page.lookups
+    assert "Go to X" not in page.lookups
+
+
 def test_latest_kredo_tasks_url_uses_last_matching_page() -> None:
     mod = _load_module()
 
@@ -287,6 +392,131 @@ def test_x_repost_state_detects_already_reposted_button() -> None:
     assert mod._x_repost_state(FakePage()) == "already_reposted"
 
 
+def test_repost_in_temporary_page_closes_page_after_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """转发标签页完成后会关闭，主任务页不会被复用。"""
+    mod = _load_module()
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.page = FakePage()
+
+        def new_page(self) -> FakePage:
+            return self.page
+
+    context = FakeContext()
+    diagnostic_pages: list[FakePage] = []
+
+    def fake_repost(page: FakePage, tweet_url: str, timeout_ms: int) -> dict[str, object]:
+        assert page is context.page
+        assert tweet_url == "https://x.com/Kredofun/status/123"
+        assert timeout_ms == 30_000
+        return {"status": "reposted"}
+
+    monkeypatch.setattr(mod, "_repost_tweet", fake_repost)
+
+    result = mod._repost_in_temporary_page(
+        context,
+        "https://x.com/Kredofun/status/123",
+        diagnostic_pages.append,
+    )
+
+    assert result == {"status": "reposted"}
+    assert diagnostic_pages == [context.page]
+    assert context.page.is_closed()
+
+
+def test_repair_blank_oauth_popup_navigates_manual_bind_page() -> None:
+    mod = _load_module()
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "about:blank"
+            self.closed = False
+            self.navigations: list[str] = []
+            self.delays: list[int] = []
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        def goto(self, url: str, wait_until: str, timeout: int) -> None:
+            assert wait_until == "domcontentloaded"
+            assert timeout == 60_000
+            self.navigations.append(url)
+            self.url = url
+
+        def wait_for_timeout(self, delay_ms: int) -> None:
+            self.delays.append(delay_ms)
+
+    class FakeContext:
+        def __init__(self, page: FakePage) -> None:
+            self.pages = [page]
+
+    page = FakePage()
+    context = FakeContext(page)
+    oauth_pages: list[FakePage] = []
+
+    mod._repair_blank_oauth_popup(
+        context,
+        ["https://x.com/i/oauth2/authorize?state=fixture"],
+        oauth_pages,
+    )
+
+    assert oauth_pages == [page]
+    assert page.navigations == ["https://x.com/i/oauth2/authorize?state=fixture"]
+    assert page.delays == [1000]
+
+
+def test_repair_blank_oauth_popup_handles_url_arriving_before_new_page() -> None:
+    """授权地址先返回时，新建空白页随后出现也会被立即导航。"""
+    mod = _load_module()
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "about:blank"
+            self.closed = False
+            self.navigations: list[str] = []
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        def goto(self, url: str, wait_until: str, timeout: int) -> None:
+            assert wait_until == "domcontentloaded"
+            assert timeout == 60_000
+            self.navigations.append(url)
+            self.url = url
+
+        def wait_for_timeout(self, _delay_ms: int) -> None:
+            pass
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.pages: list[FakePage] = []
+
+    context = FakeContext()
+    oauth_pages: list[FakePage] = []
+    authorize_urls = ["https://x.com/i/oauth2/authorize?state=fixture"]
+
+    mod._repair_blank_oauth_popup(context, authorize_urls, oauth_pages)
+    page = FakePage()
+    context.pages.append(page)
+    mod._repair_blank_oauth_popup(context, authorize_urls, oauth_pages)
+
+    assert oauth_pages == [page]
+    assert page.navigations == [authorize_urls[0]]
+
+
 def test_click_first_visible_containing_handles_extra_button_text() -> None:
     mod = _load_module()
 
@@ -309,6 +539,9 @@ def test_click_first_visible_containing_handles_extra_button_text() -> None:
     class FakePage:
         def __init__(self) -> None:
             self.button = FakeLocator(visible=True)
+
+        def wait_for_timeout(self, _delay_ms: int) -> None:
+            pass
 
         def get_by_role(self, role: str, name: str, exact: bool) -> FakeLocator:
             assert role == "button"
