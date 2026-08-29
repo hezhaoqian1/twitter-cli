@@ -16,6 +16,8 @@ class RedisListClient(Protocol):
 
     def rpush(self, name: str, value: str) -> int: ...
 
+    def rpoplpush(self, source: str, destination: str) -> str | None: ...
+
     def brpoplpush(self, source: str, destination: str, timeout: int = 0) -> str | None: ...
 
     def lrem(self, name: str, count: int, value: str) -> int: ...
@@ -112,11 +114,14 @@ class RedisTaskQueue:
 
     def receive(self, *, timeout: int = 0) -> TaskMessage | None:
         """Move one ready message to processing so it survives worker crashes."""
-        payload = self.client.brpoplpush(
-            self.ready_key,
-            self.processing_key,
-            timeout=timeout,
-        )
+        if timeout <= 0:
+            payload = self.client.rpoplpush(self.ready_key, self.processing_key)
+        else:
+            payload = self.client.brpoplpush(
+                self.ready_key,
+                self.processing_key,
+                timeout=timeout,
+            )
         return TaskMessage.decode(payload) if payload is not None else None
 
     def acknowledge(self, message: TaskMessage) -> None:

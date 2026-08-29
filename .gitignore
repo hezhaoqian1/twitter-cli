@@ -17,3 +17,4 @@ build/
 .idea/
 .gstack/
 manager_ui/node_modules/
+artifacts/

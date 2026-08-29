@@ -6,6 +6,11 @@
 
 A terminal-first CLI for Twitter/X: read timelines, bookmarks, and user profiles without API keys.
 
+For the local account-wallet manager and Kredo browser workbench, start with
+[`docs/manager-operator-guide.md`](./docs/manager-operator-guide.md). Windows
+desktop setup is documented in
+[`docs/manager-windows-local-run.md`](./docs/manager-windows-local-run.md).
+
 ## More Tools
 
 - [xiaohongshu-cli](https://github.com/jackwener/xiaohongshu-cli) — Xiaohongshu (小红书) CLI for notes and account workflows

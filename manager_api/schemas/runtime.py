@@ -70,6 +70,9 @@ class OperationStageSummary(BaseModel):
     ready: int
     waiting: int = 0
     failed: int = 0
+    pollable: int = 0
+    retryable: int = 0
+    status_syncable: int = 0
     detail: str
 
 
@@ -79,3 +82,42 @@ class OperationsSummaryResponse(BaseModel):
     generated_at: datetime
     resources: OperationResourceCounts
     stages: list[OperationStageSummary]
+
+
+class NextStageRecommendationResponse(BaseModel):
+    """Read-only next action suggestion for the staged operations console."""
+
+    action: str
+    stage: str | None
+    command: str
+    reason: str
+
+
+class AcceptanceStageResponse(BaseModel):
+    """One redacted acceptance row for an independently runnable stage."""
+
+    stage: str
+    ready: int
+    waiting: int
+    failed: int
+    pollable: int
+    retryable: int
+    status_syncable: int = 0
+
+
+class AcceptanceActionResponse(BaseModel):
+    """One redacted operator action surfaced by acceptance audit."""
+
+    action: str
+    stage: str
+    count: int
+    command: str
+
+
+class AcceptanceAuditResponse(BaseModel):
+    """Read-only acceptance audit snapshot with no secret material."""
+
+    resources: dict[str, int]
+    stages: list[AcceptanceStageResponse]
+    next_action: NextStageRecommendationResponse
+    actions: list[AcceptanceActionResponse]

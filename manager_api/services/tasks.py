@@ -105,6 +105,7 @@ class TaskService:
         task_batch_id: UUID | None = None,
         depends_on_task_id: UUID | None = None,
         allow_pending_binding: bool = False,
+        external_operation_ref: str | None = None,
     ) -> TaskCreateResult:
         """Create a queued task or return the existing job for its idempotency key."""
         target = external_target.strip()
@@ -139,6 +140,8 @@ class TaskService:
         ).unique().scalar_one_or_none()
         if existing is not None:
             return TaskCreateResult(existing, reused=True)
+        if kind is TaskKind.CLAIM and depends_on_task_id is None and binding_id is not None:
+            self.require_claim_ready(binding_id)
 
         lease_keys = self._lease_keys(resolved_account, resolved_wallet)
         job = TaskJob(
@@ -152,6 +155,9 @@ class TaskService:
             binding_id=binding_id,
             depends_on_task_id=depends_on_task_id,
             external_target=target,
+            external_operation_ref=(
+                external_operation_ref.strip() if external_operation_ref and external_operation_ref.strip() else None
+            ),
             idempotency_key=idempotency_key,
             lease_keys=lease_keys,
             scheduled_at=scheduled_at or utc_now(),
@@ -460,6 +466,37 @@ class TaskService:
             self.poll(job.id)
             changed += 1
         return changed
+
+    def require_claim_ready(self, binding_id: UUID) -> None:
+        """确认领取任务只从已完成转发校验的绑定创建。"""
+        binding = self.session.get(AccountWalletBinding, binding_id)
+        if binding is None:
+            raise TaskConflictError("binding_not_found", "binding not found")
+        if binding.state is not BindingState.BOUND:
+            raise TaskConflictError("binding_not_confirmed", "binding is not confirmed")
+
+        succeeded_repost = self.session.scalar(
+            select(TaskJob.id)
+            .where(
+                TaskJob.binding_id == binding_id,
+                TaskJob.kind == TaskKind.REPOST,
+                TaskJob.state == TaskState.SUCCEEDED,
+            )
+            .limit(1)
+        )
+        if succeeded_repost is None:
+            raise TaskConflictError("claim_not_ready", "repost validation has not succeeded")
+
+        blocking_claim = self.session.scalar(
+            select(TaskJob.id)
+            .where(
+                TaskJob.binding_id == binding_id,
+                TaskJob.kind == TaskKind.CLAIM,
+            )
+            .limit(1)
+        )
+        if blocking_claim is not None:
+            raise TaskConflictError("claim_already_exists", "claim task already exists")
 
     def recover_expired_lease(self, task_id: UUID) -> TaskJob:
         """Requeue a leased or running task after its worker lease expires."""

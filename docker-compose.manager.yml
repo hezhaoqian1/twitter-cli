@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_DB: manager
       POSTGRES_USER: manager
-      POSTGRES_PASSWORD: manager
+      POSTGRES_PASSWORD: ${MANAGER_POSTGRES_PASSWORD:-manager}
     ports:
       - "5433:5432"
     volumes:
@@ -34,7 +34,8 @@ services:
       dockerfile: Dockerfile.manager
     command: ["uvicorn", "--factory", "manager_api.main:create_app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
-      DATABASE_URL: postgresql://manager:manager@postgres:5432/manager
+      DATABASE_URL: postgresql://manager@postgres:5432/manager
+      PGPASSWORD: ${MANAGER_POSTGRES_PASSWORD:-manager}
       REDIS_URL: redis://redis:6379/0
       SESSION_SECRET: ${SESSION_SECRET:-local-manager-session-secret-change-me}
     ports:
@@ -44,6 +45,32 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.manager
+    command: ["python", "scripts/manager_worker.py"]
+    environment:
+      DATABASE_URL: postgresql://manager@postgres:5432/manager
+      PGPASSWORD: ${MANAGER_POSTGRES_PASSWORD:-manager}
+      REDIS_URL: redis://redis:6379/0
+      SESSION_SECRET: ${SESSION_SECRET:-local-manager-session-secret-change-me}
+      WORKER_VAULT_PASSWORD: ${WORKER_VAULT_PASSWORD:-}
+      MANAGER_KREDO_WORKFLOW_FACTORY: manager_api.adapters.kredo_browser_workflow:kredo_workflow_factory
+      MANAGER_KREDO_BROWSER_ARTIFACT_DIR: /app/artifacts/kredo-worker
+      MANAGER_KREDO_BROWSER_TIMEOUT_SECONDS: ${MANAGER_KREDO_BROWSER_TIMEOUT_SECONDS:-120}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-3}
+      BROWSER_CONCURRENCY: ${BROWSER_CONCURRENCY:-2}
+    volumes:
+      - ./artifacts:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
 
 volumes:
   manager-postgres-data:

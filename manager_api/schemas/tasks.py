@@ -7,6 +7,7 @@ from enum import Enum
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic import SecretStr
 
 from ..models.tasks import TaskKind, TaskState
 
@@ -48,27 +49,6 @@ class TaskBatchCreateRequest(BaseModel):
     dispatch_limit: int = Field(default=10, ge=1, le=32)
 
 
-class WorkflowBatchItemRequest(BaseModel):
-    """One account-wallet pair in the login, binding, repost, and claim workflow."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    social_account_id: UUID
-    wallet_id: UUID
-    repost_target: str = Field(min_length=1, max_length=512)
-    priority: int = Field(default=0, ge=-100, le=100)
-
-
-class WorkflowBatchCreateRequest(BaseModel):
-    """Create verify, bind, repost, and claim jobs for each independent pair."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(min_length=1, max_length=255)
-    items: list[WorkflowBatchItemRequest] = Field(min_length=1, max_length=500)
-    dispatch_limit: int = Field(default=10, ge=1, le=32)
-
-
 class WorkflowStage(str, Enum):
     """Independent console stage for batch creation."""
 
@@ -99,6 +79,107 @@ class WorkflowStageBatchCreateRequest(BaseModel):
     stage: WorkflowStage
     items: list[WorkflowStageBatchItemRequest] = Field(min_length=1, max_length=500)
     dispatch_limit: int = Field(default=10, ge=1, le=32)
+
+
+class StagePollRequeueRequest(BaseModel):
+    """Preview or requeue waiting external-validation tasks for one stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: WorkflowStage
+    limit: int = Field(default=10, ge=1, le=500)
+    apply: bool = False
+
+
+class StagePollRequeueResponse(BaseModel):
+    """Redacted result for bulk status-poll maintenance."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: WorkflowStage
+    selected: int
+    requeued: int
+    skipped_missing_ref: int
+    apply: bool
+
+
+class StageRetryRequest(BaseModel):
+    """Preview or retry failed tasks for one independent workflow stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: WorkflowStage
+    limit: int = Field(default=10, ge=1, le=500)
+    apply: bool = False
+
+
+class StageRetryResponse(BaseModel):
+    """Redacted result for bulk failed-stage retry maintenance."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: WorkflowStage
+    selected: int
+    retried: int
+    apply: bool
+
+
+class BindStatusSyncRequest(BaseModel):
+    """Preview or queue read-only status sync jobs for pending bindings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(default="bind status sync", min_length=1, max_length=255)
+    limit: int = Field(default=10, ge=1, le=500)
+    dispatch_limit: int = Field(default=10, ge=1, le=32)
+    apply: bool = False
+
+
+class BindStatusSyncResponse(BaseModel):
+    """Redacted aggregate result for pending-binding status sync."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    apply: bool
+    name: str
+    limit: int
+    pending_bindings: int
+    selected: int
+    created_jobs: int
+    reused_jobs: int
+    paused_action_jobs: int
+    skipped_existing_status_job: int
+    skipped_active_lease: int
+    skipped_missing_secret: int
+
+
+class PairedBindStageRequest(BaseModel):
+    """Create or preview bind jobs by matching account and private-key input rows."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accounts_content: SecretStr
+    private_keys_content: SecretStr
+    name: str = Field(min_length=1, max_length=255)
+    limit: int = Field(default=10, ge=1, le=500)
+    dispatch_limit: int = Field(default=10, ge=1, le=32)
+    include_unverified: bool = False
+    apply: bool = False
+
+
+class PairedBindStageResponse(BaseModel):
+    """Redacted aggregate result for exact row-paired bind creation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    apply: bool
+    name: str
+    limit: int
+    dispatch_limit: int
+    total_pairs: int
+    selected_pairs: int
+    created_jobs: int
+    counts: dict[str, int]
 
 
 class TaskTransitionRequest(BaseModel):

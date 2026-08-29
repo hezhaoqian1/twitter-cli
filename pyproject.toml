@@ -39,6 +39,7 @@ dependencies = [
     "eth-account>=0.13,<1",
     "mnemonic>=0.21,<1",
     "python-multipart>=0.0.20,<1",
+    "playwright>=1.49,<2",
 ]
 
 [project.optional-dependencies]
@@ -77,4 +78,4 @@ warn_unused_ignores = true
 no_implicit_optional = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["twitter_cli"]
+packages = ["twitter_cli", "manager_api"]

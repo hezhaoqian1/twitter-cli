@@ -21,6 +21,15 @@ class WalletImportRequest(BaseModel):
     count: int = Field(default=1, ge=1, le=100)
 
 
+class WalletPrivateKeysRequest(BaseModel):
+    """Accept one-private-key-per-line input without echoing the source."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: SecretStr = Field(min_length=1)
+    label_prefix: str | None = Field(default=None, max_length=255)
+
+
 class WalletDeriveRequest(BaseModel):
     """Request more addresses from an already encrypted mnemonic source."""
 

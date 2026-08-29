@@ -15,7 +15,11 @@ from manager_api.queue import TaskMessage
 from manager_api.runner import TaskRunner
 from manager_api.scheduler import Scheduler
 from manager_api.services.bindings import BindingService
-from manager_api.services.workflows import WorkflowBatchItem, WorkflowService
+from manager_api.services.workflows import (
+    WorkflowService,
+    WorkflowStage,
+    WorkflowStageBatchItem,
+)
 from manager_api.task_outcomes import WorkerOutcome
 from manager_api.worker import TaskWorker
 
@@ -68,22 +72,29 @@ def _pair(session: Session, suffix: int) -> tuple[SocialAccount, Wallet]:
     return account, wallet
 
 
-def test_runner_drains_independent_workflow_batch() -> None:
-    """The queue runner advances all pairs while preserving each dependency chain."""
+def test_runner_drains_independent_stage_batches() -> None:
+    """Runner drains only the stage batches explicitly created by the operator."""
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
         pairs = [_pair(session, index) for index in range(1, 4)]
-        result = WorkflowService(session).create_batch(
-            name="Runner smoke batch",
+        workflows = WorkflowService(session)
+        verify = workflows.create_stage_batch(
+            name="Runner verify batch",
+            stage=WorkflowStage.VERIFY,
             dispatch_limit=2,
             items=[
-                WorkflowBatchItem(
-                    social_account_id=account.id,
-                    wallet_id=wallet.id,
-                    repost_target=f"tweet-{index}",
-                )
-                for index, (account, wallet) in enumerate(pairs, start=1)
+                WorkflowStageBatchItem(social_account_id=account.id)
+                for account, _wallet in pairs
+            ],
+        )
+        bind = workflows.create_stage_batch(
+            name="Runner bind batch",
+            stage=WorkflowStage.BIND,
+            dispatch_limit=2,
+            items=[
+                WorkflowStageBatchItem(social_account_id=account.id, wallet_id=wallet.id)
+                for account, wallet in pairs
             ],
         )
         scheduler = Scheduler(
@@ -112,19 +123,49 @@ def test_runner_drains_independent_workflow_batch() -> None:
             queue=queue,
             handler=handler,
         )
-        drained = runner.run_until_idle(
+        first_drain = runner.run_until_idle(
+            dispatch_limit=2,
+            max_jobs_per_cycle=2,
+            max_cycles=20,
+        )
+        bindings = session.query(AccountWalletBinding).order_by(AccountWalletBinding.id).all()
+        assert all(binding.state is BindingState.BOUND for binding in bindings)
+
+        repost = workflows.create_stage_batch(
+            name="Runner repost batch",
+            stage=WorkflowStage.REPOST,
+            dispatch_limit=2,
+            items=[
+                WorkflowStageBatchItem(binding_id=binding.id, external_target=f"tweet-{index}")
+                for index, binding in enumerate(bindings, start=1)
+            ],
+        )
+        second_drain = runner.run_until_idle(
+            dispatch_limit=2,
+            max_jobs_per_cycle=2,
+            max_cycles=20,
+        )
+        claim = workflows.create_stage_batch(
+            name="Runner claim batch",
+            stage=WorkflowStage.CLAIM,
+            dispatch_limit=2,
+            items=[WorkflowStageBatchItem(binding_id=binding.id) for binding in bindings],
+        )
+        third_drain = runner.run_until_idle(
             dispatch_limit=2,
             max_jobs_per_cycle=2,
             max_cycles=20,
         )
 
-        jobs = [job for chain in result.jobs for job in chain]
-        assert drained.dispatched == 12
-        assert drained.completed == 12
-        assert drained.cycles < 20
+        jobs = [*verify.jobs, *bind.jobs, *repost.jobs, *claim.jobs]
+        assert first_drain.dispatched == 6
+        assert first_drain.completed == 6
+        assert second_drain.dispatched == 3
+        assert second_drain.completed == 3
+        assert third_drain.dispatched == 3
+        assert third_drain.completed == 3
         assert all(job.state is TaskState.SUCCEEDED for job in jobs)
         assert not queue.ready
         assert not queue.processing
-        bindings = session.query(AccountWalletBinding).all()
         assert bindings
         assert all(binding.state is BindingState.BOUND for binding in bindings)

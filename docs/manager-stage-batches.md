@@ -27,6 +27,8 @@ For the day-to-day operator sequence, see
    - Scope: one confirmed binding.
    - Task kind: `repost`.
    - Batch label: `stage:repost`.
+   - Readiness: requires a confirmed binding with no existing repost task for
+     that row and target.
    - Result: submits the repost once, then polls provider status without
      repeating the repost while the task is `waiting_external_validation`.
 
@@ -34,6 +36,8 @@ For the day-to-day operator sequence, see
    - Scope: one confirmed binding.
    - Task kind: `claim`.
    - Batch label: `stage:claim`.
+   - Readiness: requires a succeeded repost task and no existing claim task
+     for the same binding.
    - Result: claims the reward for the binding.
 
 ## Scheduling Model
@@ -45,8 +49,23 @@ For the day-to-day operator sequence, see
 - Operators can create a verify batch for all accounts, wait, create a bind
   batch for selected pairs, wait for Kredo state, then create repost and claim
   batches when rows are ready.
+- A failed row is retried from the task page so the same durable task keeps its
+  history. Creating a new stage batch is reserved for rows that have not yet
+  entered that stage.
+- Bulk failure handling uses `任务` -> `批量重试` or
+  `scripts/manager_retry_stage_failures.py`. It previews selected failed rows
+  first, then requeues only when `apply`/`--apply` is set.
+- Slow external-state handling uses `任务` -> `批量轮询` or
+  `scripts/manager_requeue_stage_polls.py`. It requeues status reads for
+  waiting tasks without submitting a second repost or claim.
+- The API rejects claim stage creation before repost validation succeeds, which
+  keeps CLI, UI, and server-side operators on the same state machine.
 - The default dispatch window is 10. It can be lowered for browser-heavy
   provider runs or raised after runtime observation.
+- When imported account rows and private-key rows are meant to correspond, use
+  `scripts/manager_create_bound_pairs_from_files.py` for the bind stage instead
+  of the generic database-order selector. The paired script preserves input
+  line order and does not compact later rows when an earlier row is skipped.
 
 ## Secret Handling
 

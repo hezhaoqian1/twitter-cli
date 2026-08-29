@@ -16,14 +16,18 @@ from manager_api.adapters.protocol import (
 from manager_api.db.base import Base, utc_now
 from manager_api.models.accounts import AccountHealth
 from manager_api.models.bindings import AccountWalletBinding, BindingState
-from manager_api.models.tasks import TaskState
+from manager_api.models.tasks import TaskJob, TaskKind, TaskState
 from manager_api.models.wallets import WalletSourceType
 from manager_api.scheduler import Scheduler
 from manager_api.services.execution import ExecutionConfig, TaskExecutionService
 from manager_api.services.imports import AccountImportService
 from manager_api.services.vault import VaultService
 from manager_api.services.wallets import WalletService
-from manager_api.services.workflows import WorkflowBatchItem, WorkflowService
+from manager_api.services.workflows import (
+    WorkflowService,
+    WorkflowStage,
+    WorkflowStageBatchItem,
+)
 from manager_api.worker import TaskWorker
 
 
@@ -120,23 +124,13 @@ def _setup_pair(session: Session):
     return vault, account, wallet
 
 
-def test_execution_service_runs_encrypted_pair_through_full_workflow() -> None:
-    """完整四阶段使用解密材料，并在转发后执行领取。"""
+def test_execution_service_runs_each_encrypted_stage_when_explicitly_created() -> None:
+    """每个阶段都要显式建批次，执行层只处理当前租约任务。"""
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
         vault, account, wallet = _setup_pair(session)
-        result = WorkflowService(session).create_batch(
-            name="synthetic execution",
-            dispatch_limit=2,
-            items=[
-                WorkflowBatchItem(
-                    social_account_id=account.id,
-                    wallet_id=wallet.id,
-                    repost_target="https://x.test/status/123",
-                )
-            ],
-        )
+        workflows = WorkflowService(session)
         x_adapter = FakeXAdapter()
         kredo_adapter = FakeKredoAdapter()
         execution = TaskExecutionService(
@@ -149,21 +143,52 @@ def test_execution_service_runs_encrypted_pair_through_full_workflow() -> None:
         scheduler = Scheduler(session, worker_concurrency=1, browser_concurrency=1)
         worker = TaskWorker(session, scheduler=scheduler)
 
+        workflows.create_stage_batch(
+            name="synthetic verify",
+            stage=WorkflowStage.VERIFY,
+            items=[WorkflowStageBatchItem(social_account_id=account.id)],
+        )
         verify_grant = scheduler.dispatch_once(limit=1)[0]
         verify = worker.run_one(verify_grant, execution.handle)
         assert verify.state is TaskState.SUCCEEDED
         assert account.health is AccountHealth.HEALTHY
 
+        bind_batch = workflows.create_stage_batch(
+            name="synthetic bind",
+            stage=WorkflowStage.BIND,
+            items=[
+                WorkflowStageBatchItem(
+                    social_account_id=account.id,
+                    wallet_id=wallet.id,
+                )
+            ],
+        )
         bind_grant = scheduler.dispatch_once(limit=1)[0]
         bind = worker.run_one(bind_grant, execution.handle)
         assert bind.state is TaskState.SUCCEEDED
-        binding = session.get(AccountWalletBinding, result.jobs[0][1].binding_id)
+        binding = session.get(AccountWalletBinding, bind_batch.jobs[0].binding_id)
         assert binding is not None
         assert binding.state is BindingState.BOUND
 
+        workflows.create_stage_batch(
+            name="synthetic repost",
+            stage=WorkflowStage.REPOST,
+            items=[
+                WorkflowStageBatchItem(
+                    binding_id=binding.id,
+                    external_target="https://x.test/status/123",
+                )
+            ],
+        )
         repost_grant = scheduler.dispatch_once(limit=1)[0]
         repost = worker.run_one(repost_grant, execution.handle)
         assert repost.state is TaskState.SUCCEEDED
+
+        workflows.create_stage_batch(
+            name="synthetic claim",
+            stage=WorkflowStage.CLAIM,
+            items=[WorkflowStageBatchItem(binding_id=binding.id)],
+        )
         claim_grant = scheduler.dispatch_once(limit=1)[0]
         claim = worker.run_one(claim_grant, execution.handle)
         assert claim.state is TaskState.SUCCEEDED
@@ -174,22 +199,58 @@ def test_execution_service_runs_encrypted_pair_through_full_workflow() -> None:
         assert kredo_adapter.status_calls == 1
 
 
+def test_execution_service_never_creates_later_stage_jobs() -> None:
+    """执行单个任务只更新当前任务结果，不自动插入后续阶段。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        vault, account, wallet = _setup_pair(session)
+        workflows = WorkflowService(session)
+        x_adapter = FakeXAdapter()
+        kredo_adapter = FakeKredoAdapter()
+        execution = TaskExecutionService(
+            session,
+            vault=vault,
+            x_adapter=x_adapter,
+            kredo_adapter=kredo_adapter,
+        )
+        scheduler = Scheduler(session, worker_concurrency=1, browser_concurrency=1)
+        worker = TaskWorker(session, scheduler=scheduler)
+
+        workflows.create_stage_batch(
+            name="verify only",
+            stage=WorkflowStage.VERIFY,
+            items=[WorkflowStageBatchItem(social_account_id=account.id)],
+        )
+        verify = worker.run_one(scheduler.dispatch_once(limit=1)[0], execution.handle)
+        assert verify.state is TaskState.SUCCEEDED
+        assert session.query(AccountWalletBinding).count() == 0
+        assert session.query(TaskJob).count() == 1
+
+        bind_batch = workflows.create_stage_batch(
+            name="bind only",
+            stage=WorkflowStage.BIND,
+            items=[WorkflowStageBatchItem(social_account_id=account.id, wallet_id=wallet.id)],
+        )
+        bind = worker.run_one(scheduler.dispatch_once(limit=1)[0], execution.handle)
+        assert bind.state is TaskState.SUCCEEDED
+        assert bind_batch.jobs[0].kind is TaskKind.BIND
+        assert session.query(AccountWalletBinding).count() == 1
+        assert session.query(TaskJob).filter(TaskJob.kind == TaskKind.REPOST).count() == 0
+        assert session.query(TaskJob).filter(TaskJob.kind == TaskKind.CLAIM).count() == 0
+
+
 def test_execution_service_preserves_delayed_external_state_for_polling() -> None:
     """外部延迟状态进入等待态，并生成未来轮询时间而不是重复动作。"""
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
         vault, account, wallet = _setup_pair(session)
-        WorkflowService(session).create_batch(
-            name="synthetic pending",
-            dispatch_limit=1,
-            items=[
-                WorkflowBatchItem(
-                    social_account_id=account.id,
-                    wallet_id=wallet.id,
-                    repost_target="https://x.test/status/456",
-                )
-            ],
+        workflows = WorkflowService(session)
+        bind_batch = workflows.create_stage_batch(
+            name="synthetic bind first",
+            stage=WorkflowStage.BIND,
+            items=[WorkflowStageBatchItem(social_account_id=account.id, wallet_id=wallet.id)],
         )
         x_adapter = FakeXAdapter()
         kredo_adapter = FakeKredoAdapter(status_value=ExternalStatus.PENDING)
@@ -203,8 +264,20 @@ def test_execution_service_preserves_delayed_external_state_for_polling() -> Non
         scheduler = Scheduler(session, worker_concurrency=1, browser_concurrency=1)
         worker = TaskWorker(session, scheduler=scheduler)
 
-        worker.run_one(scheduler.dispatch_once(limit=1)[0], execution.handle)
-        worker.run_one(scheduler.dispatch_once(limit=1)[0], execution.handle)
+        bind = worker.run_one(scheduler.dispatch_once(limit=1)[0], execution.handle)
+        assert bind.state is TaskState.SUCCEEDED
+        binding_id = bind_batch.jobs[0].binding_id
+        assert binding_id is not None
+        workflows.create_stage_batch(
+            name="synthetic delayed repost",
+            stage=WorkflowStage.REPOST,
+            items=[
+                WorkflowStageBatchItem(
+                    binding_id=binding_id,
+                    external_target="https://x.test/status/456",
+                )
+            ],
+        )
         repost = worker.run_one(scheduler.dispatch_once(limit=1)[0], execution.handle)
 
         assert repost.state is TaskState.WAITING_EXTERNAL_VALIDATION
@@ -220,3 +293,47 @@ def test_execution_service_preserves_delayed_external_state_for_polling() -> Non
         assert polled.state is TaskState.WAITING_EXTERNAL_VALIDATION
         assert x_adapter.repost_calls == 1
         assert kredo_adapter.status_calls == 2
+
+
+def test_execution_service_polls_delayed_bind_without_reclicking() -> None:
+    """绑定进入等待态后，后续轮询只读 Kredo 状态，不重复触发 OAuth。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        vault, account, wallet = _setup_pair(session)
+        result = WorkflowService(session).create_stage_batch(
+            name="synthetic delayed bind",
+            stage=WorkflowStage.BIND,
+            items=[
+                WorkflowStageBatchItem(
+                    social_account_id=account.id,
+                    wallet_id=wallet.id,
+                )
+            ],
+        )
+        x_adapter = FakeXAdapter()
+        kredo_adapter = FakeKredoAdapter(
+            bind_status=ExternalStatus.PENDING,
+            status_value=ExternalStatus.SUCCEEDED,
+        )
+        execution = TaskExecutionService(
+            session,
+            vault=vault,
+            x_adapter=x_adapter,
+            kredo_adapter=kredo_adapter,
+            config=ExecutionConfig(poll_delay_seconds=0),
+        )
+        scheduler = Scheduler(session, worker_concurrency=1, browser_concurrency=1)
+        worker = TaskWorker(session, scheduler=scheduler)
+
+        bind = worker.run_one(scheduler.dispatch_once(limit=1)[0], execution.handle)
+        assert bind.state is TaskState.WAITING_EXTERNAL_VALIDATION
+        assert kredo_adapter.bind_calls == 1
+
+        polled = worker.run_one(scheduler.dispatch_once(limit=1)[0], execution.handle)
+        binding = session.get(AccountWalletBinding, result.jobs[0].binding_id)
+        assert polled.state is TaskState.SUCCEEDED
+        assert binding is not None
+        assert binding.state is BindingState.BOUND
+        assert kredo_adapter.bind_calls == 1
+        assert kredo_adapter.status_calls == 1

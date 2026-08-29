@@ -133,6 +133,13 @@ class TaskWorker:
         )
         try:
             result = self.run_one(grant, handler)
+        except TaskConflictError as error:
+            if error.code in {"invalid_worker_state", "lease_required", "lease_not_owned"}:
+                # Redis 可能保留了旧 worker 崩溃前的消息；数据库状态才是准绳。
+                queue.acknowledge(message)
+                return TaskService(self.session).get(message.task_job_id)
+            queue.requeue(message)
+            raise
         except Exception:
             queue.requeue(message)
             raise

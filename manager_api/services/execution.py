@@ -182,8 +182,12 @@ class TaskExecutionService:
         wallet: WalletMaterial,
         operation: OperationMaterial,
     ) -> WorkerOutcome:
-        """绑定成功时只确认当前 pending 记录，避免改变历史配对。"""
-        result = self.kredo_adapter.bind(account, wallet, operation)
+        """绑定成功时确认 pending 记录；后续轮询只读状态。"""
+        result = (
+            self.kredo_adapter.status(operation, account, wallet)
+            if job.external_operation_ref
+            else self.kredo_adapter.bind(account, wallet, operation)
+        )
         if result.status.is_complete:
             binding_id = self._require_binding_id(job)
             reference = result.operation_ref or f"kredo:{binding_id}"

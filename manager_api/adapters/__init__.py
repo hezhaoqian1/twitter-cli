@@ -1,6 +1,7 @@
 """External integration adapters and their normalized contracts."""
 
 from .kredo_adapter import KredoAdapter
+from .kredo_browser_workflow import KredoBrowserWorkflow, kredo_workflow_factory
 from .protocol import (
     AccountHealthResult,
     AccountMaterial,
@@ -32,6 +33,7 @@ __all__ = [
     "ExternalOperation",
     "ExternalStatus",
     "KredoAdapter",
+    "KredoBrowserWorkflow",
     "KredoWorkflowFactory",
     "KredoWorkflowProtocol",
     "OperationMaterial",
@@ -40,5 +42,6 @@ __all__ = [
     "WalletMaterial",
     "XAdapter",
     "build_twitter_client_factory",
+    "kredo_workflow_factory",
     "redact_value",
 ]

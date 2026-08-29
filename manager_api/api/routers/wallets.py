@@ -18,6 +18,7 @@ from ...schemas.wallets import (
     WalletImportSummary,
     WalletListItem,
     WalletListResponse,
+    WalletPrivateKeysRequest,
     WalletPreviewItem,
 )
 from ...services.vault import VaultService, VaultUnlockError
@@ -100,6 +101,51 @@ def commit_wallet_source(
     )
     return WalletImportCommitResponse(
         source_id=source.id if source is not None else None,
+        source_type=preview.source_type,
+        label=preview.label,
+        summary=_summary(preview, committed=committed),
+        wallets=_preview_items(preview),
+    )
+
+
+@router.post("/wallet-sources/private-keys/preview", response_model=WalletImportPreviewResponse)
+def preview_private_key_batch(
+    request: WalletPrivateKeysRequest,
+    session: Session = Depends(get_db),
+) -> WalletImportPreviewResponse:
+    """Validate one-private-key-per-line input without persistence."""
+    try:
+        preview = WalletService(session).preview_private_keys(
+            request.content.get_secret_value(),
+            label_prefix=request.label_prefix,
+        )
+    except WalletInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _preview_response(preview)
+
+
+@router.post("/wallet-sources/private-keys", response_model=WalletImportCommitResponse)
+def commit_private_key_batch(
+    request: WalletPrivateKeysRequest,
+    session: Session = Depends(get_db),
+    vault: VaultService = Depends(get_vault),
+) -> WalletImportCommitResponse:
+    """Encrypt and persist every valid key from one-private-key-per-line input."""
+    service = WalletService(session, vault=vault)
+    try:
+        _source, preview = service.commit_private_keys(
+            request.content.get_secret_value(),
+            label_prefix=request.label_prefix,
+        )
+    except WalletInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except VaultUnlockError as exc:
+        raise HTTPException(status_code=423, detail="vault is locked") from exc
+    committed = sum(
+        decision.status is WalletImportStatus.COMMITTED for decision in preview.decisions
+    )
+    return WalletImportCommitResponse(
+        source_id=None,
         source_type=preview.source_type,
         label=preview.label,
         summary=_summary(preview, committed=committed),

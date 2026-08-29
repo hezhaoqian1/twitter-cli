@@ -133,6 +133,71 @@ def test_binding_api_is_registered_and_list_is_redacted(session: Session) -> Non
     listed = list_bindings(offset=0, limit=50, session=session)
 
     assert created.state == "pending"
+    assert created.stage.can_repost is False
+    assert created.stage.can_claim is False
     assert listed.total == 1
     assert listed.items[0].account_handle == "binding-account"
     assert "private_key" not in listed.model_dump_json()
+
+
+def test_binding_api_exposes_stage_readiness(session: Session) -> None:
+    """绑定列表按任务进度返回领取候选状态。"""
+    from manager_api.api.routers.bindings import list_bindings
+
+    account, wallet, _ = _resources(session)
+    service = BindingService(session)
+    binding = service.confirm(
+        service.create_pending(account.id, wallet.id).binding.id,
+        "external-fixture",
+    ).binding
+
+    def add_task(kind: TaskKind, state: TaskState, suffix: str) -> TaskJob:
+        """插入一个公开状态任务，用于验证绑定行聚合。"""
+        job = TaskJob(
+            kind=kind,
+            state=state,
+            attempt=1,
+            priority=0,
+            binding_id=binding.id,
+            social_account_id=account.id,
+            wallet_id=wallet.id,
+            external_target=f"fixture:{suffix}",
+            idempotency_key=f"{kind.value}:{suffix}",
+            lease_keys=[],
+            scheduled_at=utc_now(),
+        )
+        session.add(job)
+        session.flush()
+        return job
+
+    listed = list_bindings(offset=0, limit=50, session=session).items[0]
+    assert listed.stage.can_repost is True
+    assert listed.stage.can_claim is False
+
+    add_task(TaskKind.REPOST, TaskState.WAITING_EXTERNAL_VALIDATION, "repost-wait")
+    waiting = list_bindings(offset=0, limit=50, session=session).items[0]
+    assert waiting.stage.repost_state == "waiting_external_validation"
+    assert waiting.stage.repost_waiting is True
+    assert waiting.stage.can_repost is False
+    assert waiting.stage.can_claim is False
+
+    add_task(TaskKind.REPOST, TaskState.SUCCEEDED, "repost-ok")
+    claimable = list_bindings(offset=0, limit=50, session=session).items[0]
+    assert claimable.stage.repost_state == "succeeded"
+    assert claimable.stage.can_repost is False
+    assert claimable.stage.can_claim is True
+
+    add_task(TaskKind.CLAIM, TaskState.QUEUED, "claim-active")
+    claiming = list_bindings(offset=0, limit=50, session=session).items[0]
+    assert claiming.stage.claim_state == "queued"
+    assert claiming.stage.can_claim is False
+
+    add_task(TaskKind.CLAIM, TaskState.SUCCEEDED, "claim-ok")
+    claimed = list_bindings(offset=0, limit=50, session=session).items[0]
+    assert claimed.stage.claim_state == "succeeded"
+    assert claimed.stage.can_claim is False
+
+    add_task(TaskKind.CLAIM, TaskState.FAILED, "claim-failed")
+    failed_claim = list_bindings(offset=0, limit=50, session=session).items[0]
+    assert failed_claim.stage.claim_state == "failed"
+    assert failed_claim.stage.can_claim is False

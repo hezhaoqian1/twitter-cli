@@ -3,6 +3,9 @@
 This guide describes the local management console at
 `http://127.0.0.1:5178/`.
 
+For a Windows desktop setup, see
+[`manager-windows-local-run.md`](./manager-windows-local-run.md).
+
 The console manages imported X sessions, wallet addresses, immutable
 account-wallet bindings, and Kredo task stages. It is designed for one
 operator and independent rows. A slow or failed row does not pause unrelated
@@ -79,6 +82,23 @@ Select `写入 Vault` only after the row count looks correct. The list then show
 the handle, masked email, session health, lifecycle state, and whether an
 encrypted secret exists. Raw credentials are not returned by list endpoints.
 
+Server-side import uses the same parser and Vault encryption:
+
+```sh
+uv run python scripts/manager_import_operator_data.py \
+  --accounts-file ./operator-data/accounts.tsv \
+  --private-keys-file ./operator-data/private-keys.txt \
+  --vault-password-env WORKER_VAULT_PASSWORD \
+  --init-vault \
+  --recovery-key-output ./operator-data/vault-recovery.key
+```
+
+Run with `--dry-run` first to preview counts without writing rows. The command
+prints only aggregate JSON counts. It does not print account handles, cookies,
+tokens, private keys, or the recovery key. When initializing a new Vault, store
+the generated recovery key file offline and remove it from the server after
+backup procedures are verified.
+
 Recommended account sequence:
 
 1. Import all rows.
@@ -96,7 +116,7 @@ Open `地址` and select `导入地址`.
 
 Supported sources:
 
-- one private key;
+- private keys, one per line;
 - one BIP-39 mnemonic with a start index and derivation count.
 
 For mnemonic derivation, the manager uses the Ethereum BIP-44 path:
@@ -105,9 +125,10 @@ For mnemonic derivation, the manager uses the Ethereum BIP-44 path:
 m/44'/60'/0'/0/index
 ```
 
-Use `预览` to inspect public addresses and derivation paths. Only the public
-address is displayed in the list. The source material remains encrypted in
-the Vault.
+For private key import, empty lines and lines starting with `#` are ignored.
+Use `预览` to inspect public addresses, duplicate rows, and derivation paths.
+Only the public address is displayed in the list. The source material remains
+encrypted in the Vault.
 
 ## Bind Accounts to Addresses
 
@@ -135,6 +156,189 @@ available for repost and claim only after the binding state is `已绑定`.
 Confirmed pairs are not reassigned. Archive the old record if it is no longer
 needed.
 
+When the account file and private-key file are maintained as matching rows,
+prefer `账号` -> `文件配对绑定` in the management console. Paste the same account
+TSV and one-private-key-per-line input, preview the aggregate counts, then
+create the bind stage. It derives each wallet address from the private key
+input, finds the matching imported database records, and creates only a `bind`
+stage for rows that pass preflight checks.
+
+The server-side script is the same backend path and is intended for deployment
+checks or emergency operations:
+
+```sh
+uv run python scripts/manager_create_bound_pairs_from_files.py \
+  --accounts-file ./operator-data/accounts.tsv \
+  --private-keys-file ./operator-data/private-keys.txt \
+  --name "bind wave 1" \
+  --limit 10 \
+  --dispatch-limit 10 \
+  --dry-run
+```
+
+Remove `--dry-run` to create the pending bindings and bind tasks. The output is
+aggregate JSON only. It does not print handles, cookies, tokens, private keys,
+or full addresses. Rows with duplicate handles, duplicate wallet addresses,
+missing imports, unhealthy accounts, existing bindings, or active leases are
+left out of the batch. A skipped row does not shift later rows: line 12 of the
+account file is paired only with line 12 of the private-key file.
+
+## Semi-Automatic Browser Workbench
+
+Use the browser workbench when Kredo/X binding needs human confirmation in the
+headed page. This is the primary operator path for the current Kredo task.
+
+Open `绑定`, select one or more non-archived rows, then select `打开工作台`.
+The API starts one independent headed browser process per selected binding, up
+to 10 at a time. Each process:
+
+1. loads the selected row's imported X Cookie into an isolated browser context;
+2. injects the selected row's wallet private key as the local wallet provider;
+3. opens Kredo's task page;
+4. submits or confirms the fixed X repost target;
+5. leaves the browser open on the Kredo task page/modal for manual binding and
+   claiming.
+
+The default repost target is:
+
+```text
+https://x.com/Kredofun/status/2092911885209444742
+```
+
+The response only includes the binding id, local browser process id,
+screenshot path, and repost target. It does not return account passwords,
+TOTP seeds, email passwords, tokens, cookies, private keys, or mnemonics.
+
+Use this mode in waves:
+
+1. Select up to 10 pending or bound rows.
+2. Select `打开工作台`.
+3. Wait for the headed browsers to show Kredo.
+4. In each browser, complete the Kredo binding or claim action manually.
+5. Refresh the manager binding page or run the read-only status sync later.
+
+The workbench does not require a full Worker loop and does not chain into the
+next stage automatically. A row whose Kredo status updates slowly can remain
+open while other rows proceed.
+
+## Stage-Oriented Operation
+
+Run each external step as its own unit. Do not treat login, binding, repost,
+and claim as one mandatory end-to-end chain, because rows can be in different
+states and Kredo's repost validation can update slowly.
+
+Recommended flow:
+
+1. `批量校验`: verify imported X sessions first.
+2. `批量绑定`: bind only verified accounts to available addresses.
+3. Refresh or wait until rows become `已绑定`.
+4. `批量转发`: submit repost for bound rows.
+5. Poll task status until Kredo marks the repost as verified.
+6. `批量领取`: claim only rows whose repost validation has completed.
+
+Manual buttons follow the same unit boundaries:
+
+```text
+账号行: 绑定
+绑定行: 转发 / 领取 / 同步
+任务行: 暂停 / 重试 / 轮询 / 批量轮询 / 批量重试
+```
+
+Each click creates or reuses one durable task for that single operation. It
+does not automatically continue into the next operation.
+
+The binding page bulk buttons count only rows that can currently enter that
+stage. A selected row that already has a repost task is left out of a new
+repost batch. A selected row that already has a claim task is left out of a new
+claim batch. Retry failed work from `任务` so the retry stays attached to the
+original task event history.
+
+Use the two task-page maintenance actions for slow or mixed rows:
+
+- `批量轮询`: requeue waiting external-validation tasks that already have an
+  external operation reference. This is for Kredo/X state that updates slowly.
+- `批量重试`: requeue failed tasks for one stage. This is for rows whose last
+  worker attempt reached a terminal failure and should be attempted again.
+
+The same stages can be created from a server shell after the API database is
+configured:
+
+```sh
+uv run python scripts/manager_stage_status.py
+uv run python scripts/manager_next_stage.py
+
+uv run python scripts/manager_create_stage_batch.py verify --dry-run
+uv run python scripts/manager_create_stage_batch.py verify --name "verify wave 1" --limit 10 --dispatch-limit 10
+
+uv run python scripts/manager_create_stage_batch.py bind --dry-run
+uv run python scripts/manager_create_stage_batch.py bind --name "bind wave 1" --limit 10 --dispatch-limit 10
+
+uv run python scripts/manager_create_stage_batch.py repost --target "https://x.com/.../status/..." --dry-run
+uv run python scripts/manager_create_stage_batch.py repost --target "https://x.com/.../status/..." --name "repost wave 1" --limit 10 --dispatch-limit 10
+
+uv run python scripts/manager_create_stage_batch.py claim --dry-run
+uv run python scripts/manager_create_stage_batch.py claim --name "claim ready rows" --limit 10 --dispatch-limit 10
+```
+
+`bind` defaults to healthy accounts only. Use `--include-unverified` only when
+you intentionally want to bind accounts whose verification has not passed yet.
+`repost` skips rows that already have a repost task for the same target.
+`claim` selects only rows with a succeeded repost task and no existing claim
+task. The API applies the same claim readiness rule, so a direct stage request
+cannot queue a claim while Kredo repost validation is still pending.
+
+On a server, the normal loop is:
+
+```text
+status -> create next ready stage -> worker drain/worker loop -> status
+```
+
+Use `manager_acceptance_audit.py` when you want one read-only snapshot with the
+stage table, the next recommended action, and every currently available
+command template:
+
+```sh
+uv run python scripts/manager_acceptance_audit.py --limit 10
+```
+
+The management UI uses the same snapshot through:
+
+```http
+GET /api/runtime/acceptance-audit
+```
+
+Treat this as the normal binding acceptance view. It surfaces Kredo task API
+status, pollable bind callbacks, syncable pending bindings, retryable failures,
+and the next aggregate action without requiring a manual browser check.
+
+Run it before and after each batch. For mixed bind rows, it may list `poll`,
+`sync_bind_status`, and `retry` at the same time; execute those as separate
+units so one slow callback does not block the rest of the accounts.
+
+If a stage is slow but not failed, use `manager_requeue_stage_polls.py`. If a
+stage is failed, use `manager_retry_stage_failures.py`. These two commands are
+separate on purpose so a slow Kredo callback does not get treated as a fresh
+external action.
+
+Bind status is interface-first. The browser worker uses wallet login and X
+OAuth only to reach the task flow, then opens the Kredo task page and reads the
+Kredo task API responses (`tasks/twitter` and `tasks/overview`) to decide
+whether the row is bound. Page buttons are used to trigger a refresh; they are
+not the source of truth.
+
+If manual validation shows the X authorization returned to Kredo but the
+manager row is still `pending`, use `任务` -> `同步绑定状态`. This creates
+status-only bind jobs with an external operation reference, so the worker reads
+the Kredo task API and does not click the bind/OAuth action again. The command
+also pauses queued first-bind jobs for the same pending binding to avoid a
+duplicate OAuth attempt.
+
+The overview page shows the same next-step recommendation from the API, so the
+browser console and server shell share one decision path. When pending bindings
+are syncable but not pollable, the recommendation points to
+`manager_sync_bind_status.py` / `任务` -> `同步绑定状态` instead of telling the
+operator to wait.
+
 ## Repost and Claim
 
 The console intentionally separates repost from claim:
@@ -148,6 +352,17 @@ The console intentionally separates repost from claim:
 A repost job submits the action once. If Kredo has accepted the action but its
 task page has not updated, the job enters `等待外部校验`. The scheduler polls
 the external state later without submitting the repost again.
+
+The binding list now shows a per-row task stage column:
+
+```text
+转发状态 / 领取状态
+```
+
+Rows marked `可领取` are the only rows included by the bulk claim button. If a
+selected row is still waiting for repost validation, it remains selected for
+inspection but is left out of the claim batch until the next refresh shows it
+as claim-ready.
 
 This is the normal operating pattern:
 

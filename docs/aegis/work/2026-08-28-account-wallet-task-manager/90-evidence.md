@@ -210,14 +210,19 @@ Date: `2026-08-28`
 
 ## Batch 5, Task 11: Ordered Pair Workflow Evidence
 
+Superseded on 2026-08-29: the public ordered workflow API was removed after
+the operator model moved to explicit single-stage batches. Use
+`POST /api/tasks/stages` for verify, bind, repost, and claim.
+
 - Added a durable `account_wallet` workflow batch that creates one independent
   `verify_account -> bind -> repost` chain per selected pair.
 - Added a self-referential predecessor field to `task_jobs`; the scheduler only
   dispatches a dependent job after its predecessor reaches `succeeded`.
 - Each child job retains the account and wallet lease keys for its own pair, so
   a failed or delayed pair does not prevent unrelated pairs from advancing.
-- Added `POST /api/tasks/workflows` and a management-console dialog for explicit
-  account/address pairing, repost target, and default dispatch limit 10.
+- Added a now-retired workflow endpoint and management-console dialog for
+  explicit account/address pairing, repost target, and default dispatch limit
+  10.
 - Synthetic workflow suite: `6 passed`; manager suite after the change:
   `68 passed, 1 warning`.
 - Fresh SQLite migration smoke reached Alembic `head` through

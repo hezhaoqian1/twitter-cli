@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run local four-pair stage batches through the production runner and vault."""
+"""Validate each local stage batch through the production runner and vault."""
 
 from __future__ import annotations
 
 from collections import Counter, deque
 from dataclasses import dataclass, field
+from uuid import UUID
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -177,23 +178,37 @@ def _seed(session: Session) -> tuple[VaultService, list[tuple[SocialAccount, Wal
     return vault, pairs
 
 
-def _run() -> dict[str, object]:
-    """Drive the durable queue until delayed repost checks and claims finish."""
-    engine = create_engine("sqlite+pysqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        vault, pairs = _seed(session)
-        workflows = WorkflowService(session)
-        verify = workflows.create_stage_batch(
+@dataclass
+class SyntheticStageHarness:
+    """Small local harness that exposes every stage as an explicit operation."""
+
+    session: Session
+    pairs: list[tuple[SocialAccount, Wallet]]
+    workflows: WorkflowService
+    runner: TaskRunner
+    x_adapter: SyntheticXAdapter
+    kredo_adapter: SyntheticKredoAdapter
+    stage_created: dict[str, UUID] = field(default_factory=dict)
+    waiting_reposts: set[str] = field(default_factory=set)
+    cycles: int = 0
+
+    def create_verify_stage(self) -> None:
+        """显式创建账号校验阶段，不创建后续绑定任务。"""
+        verify = self.workflows.create_stage_batch(
             name="Synthetic verify stage",
             stage=WorkflowStage.VERIFY,
             items=[
                 WorkflowStageBatchItem(social_account_id=account.id, external_target="x:verify")
-                for account, _ in pairs
+                for account, _wallet in self.pairs
             ],
             dispatch_limit=4,
         )
-        bind = workflows.create_stage_batch(
+        self.stage_created["verify"] = verify.batch.id
+        self.session.commit()
+
+    def create_bind_stage(self) -> None:
+        """显式创建地址绑定阶段，不创建转发或领取任务。"""
+        bind = self.workflows.create_stage_batch(
             name="Synthetic bind stage",
             stage=WorkflowStage.BIND,
             items=[
@@ -202,111 +217,143 @@ def _run() -> dict[str, object]:
                     wallet_id=wallet.id,
                     external_target="kredo:bind",
                 )
-                for account, wallet in pairs
+                for account, wallet in self.pairs
             ],
             dispatch_limit=4,
         )
+        self.stage_created["bind"] = bind.batch.id
+        self.session.commit()
+
+    def create_repost_stage(self) -> None:
+        """显式创建转发阶段，只选择已经绑定的记录。"""
+        bindings = self._bound_bindings()
+        if len(bindings) != len(self.pairs):
+            raise RuntimeError("synthetic bind stage has not completed")
+        repost = self.workflows.create_stage_batch(
+            name="Synthetic repost stage",
+            stage=WorkflowStage.REPOST,
+            items=[
+                WorkflowStageBatchItem(
+                    binding_id=binding.id,
+                    external_target=f"https://x.test/status/synthetic-{index}",
+                )
+                for index, binding in enumerate(bindings, start=1)
+            ],
+            dispatch_limit=4,
+        )
+        self.stage_created["repost"] = repost.batch.id
+        self.session.commit()
+
+    def create_claim_stage(self) -> None:
+        """显式创建领取阶段，依赖服务层检查转发成功状态。"""
+        bindings = self._bound_bindings()
+        claim = self.workflows.create_stage_batch(
+            name="Synthetic claim stage",
+            stage=WorkflowStage.CLAIM,
+            items=[
+                WorkflowStageBatchItem(binding_id=binding.id, external_target="kredo:claim")
+                for binding in bindings
+            ],
+            dispatch_limit=4,
+        )
+        self.stage_created["claim"] = claim.batch.id
+        self.session.commit()
+
+    def drain_ready_jobs(self, *, max_cycles: int = 20) -> None:
+        """只消费当前已经显式创建的任务，不创建任何新阶段。"""
+        result = self.runner.run_until_idle(
+            dispatch_limit=4,
+            max_jobs_per_cycle=4,
+            max_cycles=max_cycles,
+        )
+        self.cycles += result.cycles
+        self.session.commit()
+
+    def record_waiting_reposts(self) -> None:
+        """记录转发慢回写任务，用于证明轮询路径被覆盖。"""
+        waiting = self.session.scalars(
+            select(TaskJob).where(
+                TaskJob.kind == TaskKind.REPOST,
+                TaskJob.state == TaskState.WAITING_EXTERNAL_VALIDATION,
+            )
+        ).all()
+        for job in waiting:
+            self.waiting_reposts.add(str(job.id))
+
+    def _bound_bindings(self) -> list[AccountWalletBinding]:
+        """返回已确认绑定，保持验收断言只依赖公开状态。"""
+        return self.session.scalars(
+            select(AccountWalletBinding)
+            .where(AccountWalletBinding.state == BindingState.BOUND)
+            .order_by(AccountWalletBinding.bound_at, AccountWalletBinding.id)
+        ).all()
+
+
+def _build_harness(session: Session) -> SyntheticStageHarness:
+    """装配本地验收依赖，所有外部 provider 都是合成实现。"""
+    vault, pairs = _seed(session)
+    x_adapter = SyntheticXAdapter()
+    kredo_adapter = SyntheticKredoAdapter()
+    execution = TaskExecutionService(
+        session,
+        vault=vault,
+        x_adapter=x_adapter,
+        kredo_adapter=kredo_adapter,
+        # 合成验收使用立即到期的轮询窗口，避免测试依赖真实睡眠。
+        config=ExecutionConfig(poll_delay_seconds=0),
+    )
+    scheduler = Scheduler(
+        session,
+        lease_ttl_seconds=60,
+        worker_concurrency=4,
+        browser_concurrency=4,
+    )
+    runner = TaskRunner(
+        scheduler=scheduler,
+        worker=TaskWorker(session, scheduler=scheduler),
+        queue=MemoryQueue(),
+        handler=execution.handle,
+    )
+    return SyntheticStageHarness(
+        session=session,
+        pairs=pairs,
+        workflows=WorkflowService(session),
+        runner=runner,
+        x_adapter=x_adapter,
+        kredo_adapter=kredo_adapter,
+    )
+
+
+def _run() -> dict[str, object]:
+    """Run explicit local stage operations and return aggregate evidence."""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        harness = _build_harness(session)
+
+        harness.create_verify_stage()
+        harness.drain_ready_jobs()
+        assert session.query(AccountWalletBinding).count() == 0
+
+        harness.create_bind_stage()
+        harness.drain_ready_jobs()
+        assert len(harness._bound_bindings()) == len(harness.pairs)
+        assert session.query(TaskJob).filter(TaskJob.kind == TaskKind.REPOST).count() == 0
+
+        harness.create_repost_stage()
+        harness.drain_ready_jobs(max_cycles=1)
+        harness.record_waiting_reposts()
+        TaskService(session).requeue_due_polls()
         session.commit()
-        x_adapter = SyntheticXAdapter()
-        kredo_adapter = SyntheticKredoAdapter()
-        execution = TaskExecutionService(
-            session,
-            vault=vault,
-            x_adapter=x_adapter,
-            kredo_adapter=kredo_adapter,
-            # 合成验收使用立即到期的轮询窗口，避免测试依赖真实睡眠。
-            config=ExecutionConfig(poll_delay_seconds=0),
-        )
-        scheduler = Scheduler(
-            session,
-            lease_ttl_seconds=60,
-            worker_concurrency=4,
-            browser_concurrency=4,
-        )
-        runner = TaskRunner(
-            scheduler=scheduler,
-            worker=TaskWorker(session, scheduler=scheduler),
-            queue=MemoryQueue(),
-            handler=execution.handle,
-        )
+        harness.drain_ready_jobs()
 
-        waiting_reposts: set[str] = set()
-        stage_created = {"verify": verify.batch.id, "bind": bind.batch.id}
-        repost_created = False
-        claim_created = False
-        cycles = 0
-        while True:
-            cycles += 1
-            runner.dispatch(limit=4)
-            while runner.run_one(timeout=0) is not None:
-                pass
-            session.commit()
-
-            waiting = session.scalars(
-                select(TaskJob).where(
-                    TaskJob.state == TaskState.WAITING_EXTERNAL_VALIDATION
-                )
-            ).all()
-            for job in waiting:
-                waiting_reposts.add(str(job.id))
-            TaskService(session).requeue_due_polls()
-            session.commit()
-
-            bound = session.scalars(
-                select(AccountWalletBinding).where(AccountWalletBinding.state == BindingState.BOUND)
-            ).all()
-            if len(bound) == len(pairs) and not repost_created:
-                repost = workflows.create_stage_batch(
-                    name="Synthetic repost stage",
-                    stage=WorkflowStage.REPOST,
-                    items=[
-                        WorkflowStageBatchItem(
-                            binding_id=binding.id,
-                            external_target=f"https://x.test/status/synthetic-{index}",
-                        )
-                        for index, binding in enumerate(bound, start=1)
-                    ],
-                    dispatch_limit=4,
-                )
-                stage_created["repost"] = repost.batch.id
-                repost_created = True
-                session.commit()
-
-            repost_jobs = session.scalars(
-                select(TaskJob).where(TaskJob.kind == TaskKind.REPOST)
-            ).all()
-            if (
-                repost_created
-                and not claim_created
-                and len(repost_jobs) == len(pairs)
-                and all(job.state is TaskState.SUCCEEDED for job in repost_jobs)
-            ):
-                bindings = session.scalars(
-                    select(AccountWalletBinding).where(AccountWalletBinding.state == BindingState.BOUND)
-                ).all()
-                claim = workflows.create_stage_batch(
-                    name="Synthetic claim stage",
-                    stage=WorkflowStage.CLAIM,
-                    items=[
-                        WorkflowStageBatchItem(binding_id=binding.id, external_target="kredo:claim")
-                        for binding in bindings
-                    ],
-                    dispatch_limit=4,
-                )
-                stage_created["claim"] = claim.batch.id
-                claim_created = True
-                session.commit()
-
-            jobs = session.scalars(select(TaskJob)).all()
-            if claim_created and all(job.state is TaskState.SUCCEEDED for job in jobs):
-                break
-            if cycles > 40:
-                raise RuntimeError("synthetic stage workflow did not become idle")
+        harness.create_claim_stage()
+        harness.drain_ready_jobs()
 
         jobs = session.scalars(select(TaskJob)).all()
         bindings = session.scalars(select(AccountWalletBinding)).all()
         accounts = session.scalars(select(SocialAccount)).all()
-        queue = runner.queue
+        queue = harness.runner.queue
         assert isinstance(queue, MemoryQueue)
         assert len(jobs) == 16
         assert Counter(job.kind for job in jobs) == Counter(
@@ -321,25 +368,42 @@ def _run() -> dict[str, object]:
         assert all(binding.state is BindingState.BOUND for binding in bindings)
         assert all(account.health is AccountHealth.HEALTHY for account in accounts)
         assert all(job.depends_on_task_id is None for job in jobs)
-        assert len(waiting_reposts) == 4
+        assert len(harness.waiting_reposts) == 4
         assert not queue.ready and not queue.processing
-        assert all(value == 1 for value in x_adapter.repost_calls.values())
-        assert all(value == 1 for value in kredo_adapter.claim_calls.values())
-        assert all(value == 1 for value in kredo_adapter.bind_calls.values())
-        assert all(value == 1 for value in x_adapter.verify_calls.values())
-        assert all(value == 2 for value in kredo_adapter.status_calls.values())
+        assert all(value == 1 for value in harness.x_adapter.repost_calls.values())
+        assert all(value == 1 for value in harness.kredo_adapter.claim_calls.values())
+        assert all(value == 1 for value in harness.kredo_adapter.bind_calls.values())
+        assert all(value == 1 for value in harness.x_adapter.verify_calls.values())
+        assert all(value == 2 for value in harness.kredo_adapter.status_calls.values())
         return {
-            "cycles": cycles,
-            "stage_batches": {name: str(batch_id) for name, batch_id in stage_created.items()},
+            "cycles": harness.cycles,
+            "stage_batches": {
+                name: str(batch_id) for name, batch_id in harness.stage_created.items()
+            },
             "jobs": len(jobs),
             "bindings_bound": len(bindings),
-            "delayed_reposts_polled": len(waiting_reposts),
-            "repost_calls": sum(x_adapter.repost_calls.values()),
-            "claim_calls": sum(kredo_adapter.claim_calls.values()),
+            "delayed_reposts_polled": len(harness.waiting_reposts),
+            "repost_calls": sum(harness.x_adapter.repost_calls.values()),
+            "claim_calls": sum(harness.kredo_adapter.claim_calls.values()),
             "queue_ready": len(queue.ready),
             "queue_processing": len(queue.processing),
         }
 
 
+def _format_summary(result: dict[str, object]) -> str:
+    """把本地验收结果输出成稳定日志行，便于 CI 和人工核对。"""
+    ordered_keys = (
+        "cycles",
+        "jobs",
+        "bindings_bound",
+        "delayed_reposts_polled",
+        "repost_calls",
+        "claim_calls",
+        "queue_ready",
+        "queue_processing",
+    )
+    return "\n".join(f"{key}={result[key]}" for key in ordered_keys)
+
+
 if __name__ == "__main__":
-    print(_run())
+    print(_format_summary(_run()))

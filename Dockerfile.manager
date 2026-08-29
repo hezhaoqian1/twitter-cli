@@ -10,7 +10,8 @@ COPY alembic ./alembic
 COPY scripts ./scripts
 
 RUN pip install --no-cache-dir uv \
-    && uv sync --no-dev --frozen
+    && uv sync --no-dev --frozen \
+    && uv run playwright install --with-deps chromium
 
 EXPOSE 8000
 

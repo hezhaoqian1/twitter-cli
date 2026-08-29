@@ -33,6 +33,11 @@ class ManagerSettings(BaseSettings):
     worker_heartbeat_ttl_seconds: float = Field(default=45.0, gt=0, le=86400)
     worker_idle_sleep_seconds: float = Field(default=1.0, gt=0, le=60)
     worker_vault_password: SecretStr | None = None
+    manager_x_adapter_factory: str = ""
+    manager_kredo_workflow_factory: str = ""
+    manager_kredo_browser_artifact_dir: str = "artifacts/kredo-worker"
+    manager_kredo_browser_timeout_seconds: int = Field(default=120, ge=1, le=1800)
+    manager_kredo_browser_headed: bool = False
 
     @property
     def sqlalchemy_url(self) -> str:

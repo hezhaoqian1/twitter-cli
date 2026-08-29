@@ -20,6 +20,7 @@ from manager_api.services.wallets import (
 
 MNEMONIC_FIXTURE = "test test test test test test test test test test test junk"
 PRIVATE_KEY_FIXTURE = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+SECOND_PRIVATE_KEY_FIXTURE = "59c6995e998f97a5a0044966f094538b292d4874067f2f3f2d8f3f3e8f5f7f8f"
 
 
 @pytest.fixture
@@ -121,6 +122,51 @@ def test_duplicate_normalized_address_is_reported_and_skipped(session: Session) 
     assert source is None
     assert committed_preview.decisions[0].status is WalletImportStatus.DUPLICATE_EXISTING
     assert session.query(Wallet).count() == 1
+
+
+def test_private_key_batch_preview_and_commit_encrypt_multiple_rows(session: Session) -> None:
+    """批量私钥导入支持一行一个，并只提交有效去重地址。"""
+    vault = _unlocked_vault(session)
+    service = WalletService(session, vault)
+    content = "\n".join(
+        [
+            "# operator note",
+            PRIVATE_KEY_FIXTURE,
+            "0x" + SECOND_PRIVATE_KEY_FIXTURE.upper(),
+            "0x" + PRIVATE_KEY_FIXTURE.upper(),
+        ]
+    )
+
+    preview = service.preview_private_keys(content, label_prefix="batch-wallet")
+    _source, committed = service.commit_private_keys(content, label_prefix="batch-wallet")
+    session.commit()
+
+    assert [decision.status for decision in preview.decisions] == [
+        WalletImportStatus.VALID,
+        WalletImportStatus.VALID,
+        WalletImportStatus.DUPLICATE_IN_FILE,
+    ]
+    assert [decision.status for decision in committed.decisions] == [
+        WalletImportStatus.COMMITTED,
+        WalletImportStatus.COMMITTED,
+        WalletImportStatus.DUPLICATE_IN_FILE,
+    ]
+    assert committed.summary(committed=2)["committed"] == 2
+    assert session.query(Wallet).count() == 2
+    assert session.query(WalletSecret).count() == 2
+    for secret in session.query(WalletSecret).all():
+        assert PRIVATE_KEY_FIXTURE.encode() not in secret.envelope
+        assert SECOND_PRIVATE_KEY_FIXTURE.encode() not in secret.envelope
+
+
+def test_private_key_batch_reports_invalid_line_number(session: Session) -> None:
+    """批量私钥格式错误时报告行号，避免操作者猜是哪一行。"""
+    service = WalletService(session)
+
+    with pytest.raises(WalletInputError) as error:
+        service.preview_private_keys(f"{PRIVATE_KEY_FIXTURE}\nnot-a-key")
+
+    assert "line 2" in str(error.value)
 
 
 def test_invalid_mnemonic_and_derivation_range_are_rejected(session: Session) -> None:

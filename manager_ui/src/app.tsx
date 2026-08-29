@@ -38,11 +38,18 @@ import {
 import {
   Account,
   AccountImportResult,
+  AcceptanceAudit,
   api,
   ApiError,
   Balance,
+  BindStatusSyncResult,
+  Binding,
+  NextStageRecommendation,
+  PairedBindResult,
   RuntimeMetrics,
   OperationsSummary,
+  StagePollRequeueResult,
+  StageRetryResult,
   Task,
   TaskBatch,
   VaultBackupSummary,
@@ -64,6 +71,8 @@ const pageMeta: Array<{ key: PageKey; label: string; icon: typeof Activity }> = 
 ];
 
 const RESOURCE_CACHE_TTL_MS = 30_000;
+const DEFAULT_REPOST_TARGET = "https://x.com/Kredofun/status/2092911885209444742";
+const WORKBENCH_LIMIT = 10;
 
 type ResourceCacheEntry<T> = {
   value: T | null;
@@ -262,6 +271,17 @@ function workflowLabel(value: string) {
     return "账号-地址工作流";
   }
   return kindLabel(value);
+}
+
+function bindingStage(binding: Binding) {
+  return binding.stage ?? {
+    repost_state: null,
+    claim_state: null,
+    can_repost: binding.state === "bound",
+    can_claim: false,
+    repost_waiting: false,
+    claim_waiting: false
+  };
 }
 
 function StateChip({ value }: { value: string }) {
@@ -550,7 +570,14 @@ export function App() {
             </button>
           </div>
         )}
-        {page === "overview" && <Overview refresh={refresh} onNavigate={setPage} />}
+        {page === "overview" && (
+          <Overview
+            refresh={refresh}
+            onNavigate={setPage}
+            onComplete={complete}
+            onNotice={notify}
+          />
+        )}
         {page === "accounts" && (
           <AccountsPage
             refresh={refresh}
@@ -584,7 +611,17 @@ export function App() {
   );
 }
 
-function Overview({ refresh, onNavigate }: { refresh: number; onNavigate: (page: PageKey) => void }) {
+function Overview({
+  refresh,
+  onNavigate,
+  onComplete,
+  onNotice
+}: {
+  refresh: number;
+  onNavigate: (page: PageKey) => void;
+  onComplete: (message: string) => void;
+  onNotice: (message: string, tone?: "success" | "error") => void;
+}) {
   const accounts = useResource("accounts", api.accounts, refresh);
   const wallets = useResource("wallets", api.wallets, refresh);
   const bindings = useResource("bindings", api.bindings, refresh);
@@ -592,6 +629,9 @@ function Overview({ refresh, onNavigate }: { refresh: number; onNavigate: (page:
   const tasks = useResource("tasks", api.tasks, refresh);
   const runtime = useResource("runtime-metrics", api.runtimeMetrics, refresh);
   const operations = useResource("operations-summary", api.operationsSummary, refresh);
+  const nextStage = useResource("next-stage", api.nextStage, refresh);
+  const acceptance = useResource("acceptance-audit", api.acceptanceAudit, refresh);
+  const [acceptanceBusyKey, setAcceptanceBusyKey] = useState<string | null>(null);
   const summary = useMemo(() => {
     const taskItems = tasks.value?.items ?? [];
     return {
@@ -605,6 +645,46 @@ function Overview({ refresh, onNavigate }: { refresh: number; onNavigate: (page:
       hsk: sumBalance(balances.value?.items ?? [], "total_hsk")
     };
   }, [accounts.value, balances.value, bindings.value, tasks.value, wallets.value]);
+
+  const runAcceptanceAction = async (action: AcceptanceAudit["actions"][number]) => {
+    const busyKey = `${action.action}-${action.stage}`;
+    setAcceptanceBusyKey(busyKey);
+    try {
+      if (action.action === "poll" && isPollableStage(action.stage)) {
+        const result = await api.requeueStagePolls({
+          stage: action.stage,
+          limit: action.count,
+          apply: true
+        });
+        onComplete(`已重新入队 ${result.requeued} 个${kindLabel(action.stage)}状态轮询`);
+        return;
+      }
+      if (action.action === "sync_bind_status") {
+        const result = await api.bindStatusSync({
+          name: `bind status sync ${new Date().toLocaleString("zh-CN")}`,
+          limit: action.count,
+          dispatch_limit: Math.min(action.count, 10),
+          apply: true
+        });
+        onComplete(`已创建 ${result.created_jobs} 个绑定状态同步任务`);
+        return;
+      }
+      if (action.action === "retry") {
+        const result = await api.retryStageFailures({
+          stage: action.stage,
+          limit: action.count,
+          apply: true
+        });
+        onComplete(`已重试 ${result.retried} 个${kindLabel(action.stage)}失败任务`);
+        return;
+      }
+      onNavigate(recommendationPage({ action: action.action, stage: action.stage, command: "", reason: "" }));
+    } catch (error) {
+      onNotice(toMessage(error), "error");
+    } finally {
+      setAcceptanceBusyKey(null);
+    }
+  };
 
   return (
     <div className="page-stack">
@@ -660,6 +740,15 @@ function Overview({ refresh, onNavigate }: { refresh: number; onNavigate: (page:
           </>
         ) : null}
       </Panel>
+      <NextStagePanel
+        recommendation={nextStage.value}
+        audit={acceptance.value}
+        loading={nextStage.loading || acceptance.loading}
+        error={nextStage.error || acceptance.error}
+        busyKey={acceptanceBusyKey}
+        onNavigate={onNavigate}
+        onRunAction={(action) => void runAcceptanceAction(action)}
+      />
       <Panel
         title="资产概览"
         action={
@@ -723,6 +812,105 @@ function Overview({ refresh, onNavigate }: { refresh: number; onNavigate: (page:
   );
 }
 
+function NextStagePanel({
+  recommendation,
+  audit,
+  loading,
+  error,
+  busyKey,
+  onNavigate,
+  onRunAction
+}: {
+  recommendation: NextStageRecommendation | null;
+  audit: AcceptanceAudit | null;
+  loading: boolean;
+  error: string | null;
+  busyKey: string | null;
+  onNavigate: (page: PageKey) => void;
+  onRunAction: (action: AcceptanceAudit["actions"][number]) => void;
+}) {
+  const activeRecommendation = audit?.next_action ?? recommendation;
+  const page = recommendationPage(activeRecommendation);
+  return (
+    <Panel
+      title="接口验收清单"
+      action={
+        <button type="button" className="text-link" onClick={() => onNavigate(page)}>
+          操作入口
+          <ArrowRight size={14} />
+        </button>
+      }
+    >
+      {loading ? (
+        <LoadingRows />
+      ) : error ? (
+        <EmptyState title="建议暂不可用" detail={error} />
+      ) : activeRecommendation ? (
+        <div className="recommendation-box">
+          <div>
+            <span>{recommendationActionLabel(activeRecommendation.action)}</span>
+            <strong>{activeRecommendation.stage ? kindLabel(activeRecommendation.stage) : "等待状态更新"}</strong>
+          </div>
+          <p>{activeRecommendation.reason}</p>
+          <code>{activeRecommendation.command}</code>
+          {audit?.actions.length ? (
+            <div className="acceptance-actions" aria-label="验收动作列表">
+              {audit.actions.slice(0, 6).map((action) => (
+                <button
+                  key={`${action.action}-${action.stage}`}
+                  type="button"
+                  className="acceptance-action"
+                  disabled={busyKey !== null}
+                  onClick={() => onRunAction(action)}
+                >
+                  <span>{recommendationActionLabel(action.action)}</span>
+                  <strong>{kindLabel(action.stage)}</strong>
+                  <small>
+                    {busyKey === `${action.action}-${action.stage}` ? (
+                      <LoaderCircle className="spin" size={12} />
+                    ) : (
+                      action.count
+                    )}
+                  </small>
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </Panel>
+  );
+}
+
+function isPollableStage(stage: string): stage is "bind" | "repost" | "claim" {
+  return stage === "bind" || stage === "repost" || stage === "claim";
+}
+
+function recommendationActionLabel(action: string) {
+  return {
+    poll: "批量轮询",
+    retry: "批量重试",
+    sync_bind_status: "同步绑定状态",
+    create_stage: "创建阶段",
+    wait: "等待"
+  }[action] || action;
+}
+
+function recommendationPage(recommendation: NextStageRecommendation | null): PageKey {
+  if (
+    !recommendation ||
+    recommendation.action === "poll" ||
+    recommendation.action === "retry" ||
+    recommendation.action === "sync_bind_status"
+  ) {
+    return "tasks";
+  }
+  if (recommendation.stage === "verify" || recommendation.stage === "bind") {
+    return "accounts";
+  }
+  return "bindings";
+}
+
 function StageCard({
   stage,
   onNavigate
@@ -736,7 +924,11 @@ function StageCard({
     repost: <Send size={18} />,
     claim: <Play size={18} />
   }[stage.key];
-  const targetPage = stage.key === "verify" || stage.key === "bind" ? "accounts" : "bindings";
+  const targetPage = stage.key === "bind" && stage.status_syncable > 0
+    ? "tasks"
+    : stage.key === "verify" || stage.key === "bind"
+      ? "accounts"
+      : "bindings";
   return (
     <button type="button" className="stage-card" onClick={() => onNavigate(targetPage)}>
       <div className="stage-card-top">
@@ -748,6 +940,9 @@ function StageCard({
       <div className="stage-meta">
         <span>{stage.waiting} 待回写</span>
         <span>{stage.failed} 失败</span>
+        <span>{stage.pollable} 可轮询</span>
+        {stage.status_syncable > 0 && <span>{stage.status_syncable} 可同步</span>}
+        <span>{stage.retryable} 可重试</span>
         <ArrowRight size={15} />
       </div>
     </button>
@@ -876,6 +1071,7 @@ function AccountsPage({
   const accounts = useResource("accounts", api.accounts, refresh);
   const bindings = useResource("bindings", api.bindings, refresh);
   const [importOpen, setImportOpen] = useState(false);
+  const [pairedBindOpen, setPairedBindOpen] = useState(false);
   const [bindingAccount, setBindingAccount] = useState<Account | null>(null);
   const [workflowMode, setWorkflowMode] = useState<"verify" | "bind" | null>(null);
   const [verifyingAccountId, setVerifyingAccountId] = useState<string | null>(null);
@@ -891,10 +1087,16 @@ function AccountsPage({
   const verifyAccount = async (account: Account) => {
     setVerifyingAccountId(account.id);
     try {
-      await api.createTask({
-        kind: "verify_account",
-        social_account_id: account.id,
-        external_target: "x:verify"
+      await api.createStageBatch({
+        name: `会话校验 @${account.handle}`,
+        stage: "verify",
+        dispatch_limit: 1,
+        items: [
+          {
+            social_account_id: account.id,
+            external_target: "x:verify"
+          }
+        ]
       });
       onComplete(`已加入 @${account.handle} 的会话校验`);
     } catch (error) {
@@ -917,6 +1119,10 @@ function AccountsPage({
             <Button onClick={() => setWorkflowMode("bind")} disabled={!vault?.unlocked}>
               <Layers3 size={16} />
               批量绑定
+            </Button>
+            <Button onClick={() => setPairedBindOpen(true)} disabled={!vault?.unlocked}>
+              <Upload size={16} />
+              文件配对绑定
             </Button>
             <Button tone="primary" onClick={() => setImportOpen(true)} disabled={!vault?.unlocked}>
               <Plus size={17} />
@@ -1005,6 +1211,16 @@ function AccountsPage({
           onClose={() => setImportOpen(false)}
           onComplete={(message) => {
             setImportOpen(false);
+            onComplete(message);
+          }}
+          onNotice={onNotice}
+        />
+      )}
+      {pairedBindOpen && (
+        <PairedBindDialog
+          onClose={() => setPairedBindOpen(false)}
+          onComplete={(message) => {
+            setPairedBindOpen(false);
             onComplete(message);
           }}
           onNotice={onNotice}
@@ -1128,18 +1344,42 @@ function BindingsPage({
   const bindings = useResource("bindings", api.bindings, refresh);
   const [selected, setSelected] = useState<string[]>([]);
   const [operation, setOperation] = useState<{ kind: "repost" | "claim"; bindingIds: string[] } | null>(null);
+  const [bindStatusSyncOpen, setBindStatusSyncOpen] = useState(false);
   const [syncing, setSyncing] = useState(false);
-  const visibleBound = useMemo(
-    () => bindings.value?.items.filter((binding) => binding.state === "bound") ?? [],
+  const [launchingWorkbench, setLaunchingWorkbench] = useState(false);
+  const visibleSelectable = useMemo(
+    () => bindings.value?.items.filter((binding) => binding.state !== "archived") ?? [],
     [bindings.value]
   );
+  const pendingCount = bindings.value?.items.filter((binding) => binding.state === "pending").length ?? 0;
+  const selectedBindings = useMemo(
+    () => visibleSelectable.filter((binding) => selected.includes(binding.id)),
+    [selected, visibleSelectable]
+  );
+  const selectedBoundBindings = useMemo(
+    () => selectedBindings.filter((binding) => binding.state === "bound"),
+    [selectedBindings]
+  );
+  const repostReadySelected = useMemo(
+    () => selectedBoundBindings.filter((binding) => bindingStage(binding).can_repost).map((binding) => binding.id),
+    [selectedBoundBindings]
+  );
+  const claimReadySelected = useMemo(
+    () => selectedBoundBindings.filter((binding) => bindingStage(binding).can_claim).map((binding) => binding.id),
+    [selectedBoundBindings]
+  );
   const selectAllRef = useRef<HTMLInputElement | null>(null);
-  const allVisibleSelected = visibleBound.length > 0 && selected.length === visibleBound.length;
+  const allVisibleSelected = visibleSelectable.length > 0 && selected.length === visibleSelectable.length;
   const someVisibleSelected = selected.length > 0 && !allVisibleSelected;
+  const workbenchLaunchCount = Math.min(selected.length, WORKBENCH_LIMIT);
+  const workbenchButtonLabel =
+    selected.length > WORKBENCH_LIMIT
+      ? `打开工作台 (前 ${WORKBENCH_LIMIT}/${selected.length})`
+      : `打开工作台 (${workbenchLaunchCount})`;
 
   useEffect(() => {
-    setSelected((current) => current.filter((id) => visibleBound.some((binding) => binding.id === id)));
-  }, [bindings.value, visibleBound]);
+    setSelected((current) => current.filter((id) => visibleSelectable.some((binding) => binding.id === id)));
+  }, [bindings.value, visibleSelectable]);
   useEffect(() => {
     if (selectAllRef.current) selectAllRef.current.indeterminate = someVisibleSelected;
   }, [someVisibleSelected]);
@@ -1160,6 +1400,24 @@ function BindingsPage({
     }
   };
 
+  const launchWorkbench = async (bindingIds: string[]) => {
+    if (!bindingIds.length || launchingWorkbench) return;
+    setLaunchingWorkbench(true);
+    try {
+      const result = await api.launchManualWorkbench({
+        binding_ids: bindingIds.slice(0, WORKBENCH_LIMIT),
+        repost_target: DEFAULT_REPOST_TARGET,
+        limit: Math.min(bindingIds.length, WORKBENCH_LIMIT),
+        timeout_seconds: 45
+      });
+      onComplete(`已启动 ${result.launched} 个半自动浏览器工作台`);
+    } catch (error) {
+      onNotice(toMessage(error), "error");
+    } finally {
+      setLaunchingWorkbench(false);
+    }
+  };
+
   return (
     <div className="page-stack">
       <PageToolbar
@@ -1167,29 +1425,63 @@ function BindingsPage({
         action={
           <div className="toolbar-actions">
             <Button
-              onClick={() => setOperation({ kind: "repost", bindingIds: selected })}
-              disabled={!vault?.unlocked || selected.length === 0}
-              title={!vault?.unlocked ? "Vault 已锁定，请先解锁" : selected.length === 0 ? "先选择至少一个绑定" : "创建转发任务"}
+              onClick={() => void launchWorkbench(selected)}
+              disabled={selected.length === 0 || launchingWorkbench}
+              title={selected.length === 0 ? "先选择至少一个绑定" : "打开有头浏览器，预置 X Cookie 和钱包，并自动转发固定推文"}
+            >
+              {launchingWorkbench ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}
+              {workbenchButtonLabel}
+            </Button>
+            <Button
+              onClick={() => setBindStatusSyncOpen(true)}
+              disabled={!vault?.unlocked || pendingCount === 0}
+              title={
+                !vault?.unlocked
+                  ? "Vault 已锁定，请先解锁"
+                  : pendingCount === 0
+                    ? "暂无 pending 绑定"
+                    : "读取 Kredo 任务接口并同步 pending 绑定状态"
+              }
+            >
+              <ShieldCheck size={16} />
+              同步绑定状态 ({pendingCount})
+            </Button>
+            <Button
+              onClick={() => setOperation({ kind: "repost", bindingIds: repostReadySelected })}
+              disabled={!vault?.unlocked || repostReadySelected.length === 0}
+              title={
+                !vault?.unlocked
+                  ? "Vault 已锁定，请先解锁"
+                  : repostReadySelected.length === 0
+                    ? "所选行暂无可创建的转发任务"
+                    : "创建转发任务"
+              }
             >
               <Send size={16} />
-              批量转发 ({selected.length})
+              批量转发 ({repostReadySelected.length})
             </Button>
             <Button
               tone="primary"
-              onClick={() => setOperation({ kind: "claim", bindingIds: selected })}
-              disabled={!vault?.unlocked || selected.length === 0}
-              title={!vault?.unlocked ? "Vault 已锁定，请先解锁" : selected.length === 0 ? "先选择至少一个绑定" : "创建领取任务"}
+              onClick={() => setOperation({ kind: "claim", bindingIds: claimReadySelected })}
+              disabled={!vault?.unlocked || claimReadySelected.length === 0}
+              title={
+                !vault?.unlocked
+                  ? "Vault 已锁定，请先解锁"
+                  : claimReadySelected.length === 0
+                    ? "等待转发校验成功后再领取"
+                    : "创建领取任务"
+              }
             >
               <Play size={16} />
-              批量领取 ({selected.length})
+              批量领取 ({claimReadySelected.length})
             </Button>
             <Button
-              onClick={() => void syncBalances(selected)}
-              disabled={!vault?.unlocked || selected.length === 0 || syncing}
-              title={!vault?.unlocked ? "Vault 已锁定，请先解锁" : selected.length === 0 ? "先选择至少一个绑定" : "同步所选余额"}
+              onClick={() => void syncBalances(selectedBoundBindings.map((binding) => binding.id))}
+              disabled={!vault?.unlocked || selectedBoundBindings.length === 0 || syncing}
+              title={!vault?.unlocked ? "Vault 已锁定，请先解锁" : selectedBoundBindings.length === 0 ? "先选择至少一个已绑定行" : "同步所选余额"}
             >
               {syncing ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
-              同步余额 ({selected.length})
+              同步余额 ({selectedBoundBindings.length})
             </Button>
           </div>
         }
@@ -1201,24 +1493,25 @@ function BindingsPage({
           <EmptyState title="绑定列表暂不可用" detail={bindings.error} />
         ) : bindings.value?.items.length ? (
           <>
-            <div className="table-wrap">
+            <div className="table-wrap binding-table">
               <table>
               <thead>
                 <tr>
                   <th className="checkbox-column">
                     <input
                       ref={selectAllRef}
-                      aria-label="选择所有已绑定记录"
+                      aria-label="选择所有绑定记录"
                       type="checkbox"
                       checked={allVisibleSelected}
                       onChange={() =>
-                        setSelected(selected.length === visibleBound.length ? [] : visibleBound.map((item) => item.id))
+                        setSelected(selected.length === visibleSelectable.length ? [] : visibleSelectable.map((item) => item.id))
                       }
                     />
                   </th>
                   <th>账号</th>
                   <th>地址</th>
                   <th>绑定状态</th>
+                  <th>任务阶段</th>
                   <th>确认时间</th>
                   <th>Points</th>
                   <th>HSK</th>
@@ -1230,6 +1523,10 @@ function BindingsPage({
               <tbody>
                 {bindings.value.items.map((binding) => {
                   const eligible = binding.state === "bound";
+                  const selectable = binding.state !== "archived";
+                  const stage = bindingStage(binding);
+                  const canRepost = eligible && stage.can_repost;
+                  const canClaim = eligible && stage.can_claim;
                   return (
                     <tr key={binding.id}>
                       <td className="checkbox-column">
@@ -1237,13 +1534,29 @@ function BindingsPage({
                           aria-label={`选择 ${binding.account_handle}`}
                           type="checkbox"
                           checked={selected.includes(binding.id)}
-                          disabled={!eligible}
+                          disabled={!selectable}
                           onChange={() => toggle(binding.id)}
                         />
                       </td>
                       <td><strong>@{binding.account_handle}</strong></td>
                       <td className="mono">{compact(binding.wallet_address, 12, 8)}</td>
                       <td><StateChip value={binding.state} /></td>
+                      <td>
+                        <div className="stage-chip-group">
+                          {stage.repost_state ? (
+                            <span title="转发状态"><StateChip value={stage.repost_state} /></span>
+                          ) : (
+                            <span className="muted">未转发</span>
+                          )}
+                          {stage.claim_state ? (
+                            <span title="领取状态"><StateChip value={stage.claim_state} /></span>
+                          ) : canClaim ? (
+                            <span className="chip chip-success">可领取</span>
+                          ) : (
+                            <span className="muted">未领取</span>
+                          )}
+                        </div>
+                      </td>
                       <td>{dateTime(binding.bound_at)}</td>
                       <td className="mono">{amount(binding.balance?.points)}</td>
                       <td className="mono">{amount(binding.balance?.cash_hsk_available)}</td>
@@ -1259,6 +1572,14 @@ function BindingsPage({
                       </td>
                       <td className="row-actions">
                         <Button
+                          disabled={!selectable || launchingWorkbench}
+                          onClick={() => void launchWorkbench([binding.id])}
+                          title="打开有头浏览器，预置 X Cookie 和钱包，并自动转发固定推文"
+                        >
+                          {launchingWorkbench ? <LoaderCircle className="spin" size={14} /> : <Play size={14} />}
+                          工作台
+                        </Button>
+                        <Button
                           disabled={!eligible || !vault?.unlocked || syncing}
                           onClick={() => void syncBalances([binding.id])}
                         >
@@ -1266,15 +1587,16 @@ function BindingsPage({
                           同步
                         </Button>
                         <Button
-                          disabled={!eligible || !vault?.unlocked}
+                          disabled={!canRepost || !vault?.unlocked}
                           onClick={() => setOperation({ kind: "repost", bindingIds: [binding.id] })}
                         >
                           转发
                         </Button>
                         <Button
                           tone="primary"
-                          disabled={!eligible || !vault?.unlocked}
+                          disabled={!canClaim || !vault?.unlocked}
                           onClick={() => setOperation({ kind: "claim", bindingIds: [binding.id] })}
+                          title={canClaim ? "创建领取任务" : "等待转发校验成功后再领取"}
                         >
                           领取
                         </Button>
@@ -1288,6 +1610,10 @@ function BindingsPage({
             <div className="binding-mobile-list">
               {bindings.value.items.map((binding) => {
                 const eligible = binding.state === "bound";
+                const selectable = binding.state !== "archived";
+                const stage = bindingStage(binding);
+                const canRepost = eligible && stage.can_repost;
+                const canClaim = eligible && stage.can_claim;
                 return (
                   <article className="binding-mobile-card" key={binding.id}>
                   <div className="binding-mobile-heading">
@@ -1296,7 +1622,7 @@ function BindingsPage({
                         aria-label={`选择 ${binding.account_handle}`}
                         type="checkbox"
                         checked={selected.includes(binding.id)}
-                        disabled={!eligible}
+                        disabled={!selectable}
                         onChange={() => toggle(binding.id)}
                       />
                       <strong>@{binding.account_handle}</strong>
@@ -1310,9 +1636,16 @@ function BindingsPage({
                   <div className="binding-mobile-balances">
                     <span><small>Points</small><strong>{amount(binding.balance?.points)}</strong></span>
                     <span><small>HSK</small><strong>{amount(binding.balance?.total_hsk)}</strong></span>
-                    <span><small>同步</small><strong>{binding.balance?.sync_status === "success" ? "已同步" : "未同步"}</strong></span>
+                    <span><small>阶段</small><strong>{canClaim ? "可领取" : stage.repost_waiting ? "等回写" : stage.repost_state ? stateLabel(stage.repost_state) : "未转发"}</strong></span>
                   </div>
                   <div className="binding-mobile-actions">
+                    <Button
+                      disabled={!selectable || launchingWorkbench}
+                      onClick={() => void launchWorkbench([binding.id])}
+                    >
+                      {launchingWorkbench ? <LoaderCircle className="spin" size={14} /> : <Play size={14} />}
+                      工作台
+                    </Button>
                     <Button
                       disabled={!eligible || !vault?.unlocked || syncing}
                       onClick={() => void syncBalances([binding.id])}
@@ -1321,7 +1654,7 @@ function BindingsPage({
                       同步
                     </Button>
                     <Button
-                      disabled={!eligible || !vault?.unlocked}
+                      disabled={!canRepost || !vault?.unlocked}
                       onClick={() => setOperation({ kind: "repost", bindingIds: [binding.id] })}
                     >
                       <Send size={14} />
@@ -1329,8 +1662,9 @@ function BindingsPage({
                     </Button>
                     <Button
                       tone="primary"
-                      disabled={!eligible || !vault?.unlocked}
+                      disabled={!canClaim || !vault?.unlocked}
                       onClick={() => setOperation({ kind: "claim", bindingIds: [binding.id] })}
+                      title={canClaim ? "创建领取任务" : "等待转发校验成功后再领取"}
                     >
                       <Play size={14} />
                       领取
@@ -1358,6 +1692,16 @@ function BindingsPage({
           onNotice={onNotice}
         />
       )}
+      {bindStatusSyncOpen && (
+        <BindStatusSyncDialog
+          onClose={() => setBindStatusSyncOpen(false)}
+          onComplete={(message) => {
+            setBindStatusSyncOpen(false);
+            onComplete(message);
+          }}
+          onNotice={onNotice}
+        />
+      )}
     </div>
   );
 }
@@ -1377,6 +1721,9 @@ function TasksPage({
   const [stateFilter, setStateFilter] = useState("all");
   const [batchFilter, setBatchFilter] = useState("all");
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
+  const [stagePollOpen, setStagePollOpen] = useState(false);
+  const [stageRetryOpen, setStageRetryOpen] = useState(false);
+  const [bindStatusSyncOpen, setBindStatusSyncOpen] = useState(false);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null);
   const [busyCommand, setBusyCommand] = useState<string | null>(null);
   const resourceKey = refresh + pollTick;
@@ -1482,6 +1829,18 @@ function TasksPage({
             <IconButton label="立即刷新任务" onClick={() => setPollTick((value) => value + 1)}>
               <RefreshCw size={17} />
             </IconButton>
+            <Button onClick={() => setStagePollOpen(true)}>
+              <RefreshCw size={16} />
+              批量轮询
+            </Button>
+            <Button onClick={() => setBindStatusSyncOpen(true)}>
+              <ShieldCheck size={16} />
+              同步绑定状态
+            </Button>
+            <Button onClick={() => setStageRetryOpen(true)}>
+              <RotateCcw size={16} />
+              批量重试
+            </Button>
             <span className="subtle-label">{batches.value?.total ?? 0} 个批次</span>
           </div>
         }
@@ -1587,7 +1946,333 @@ function TasksPage({
           onClose={() => setSelectedBatchId(null)}
         />
       )}
+      {stagePollOpen && (
+        <StagePollDialog
+          onClose={() => setStagePollOpen(false)}
+          onComplete={(message) => {
+            setStagePollOpen(false);
+            setPollTick((value) => value + 1);
+            onComplete(message);
+          }}
+          onNotice={onNotice}
+        />
+      )}
+      {stageRetryOpen && (
+        <StageRetryDialog
+          onClose={() => setStageRetryOpen(false)}
+          onComplete={(message) => {
+            setStageRetryOpen(false);
+            setPollTick((value) => value + 1);
+            onComplete(message);
+          }}
+          onNotice={onNotice}
+        />
+      )}
+      {bindStatusSyncOpen && (
+        <BindStatusSyncDialog
+          onClose={() => setBindStatusSyncOpen(false)}
+          onComplete={(message) => {
+            setBindStatusSyncOpen(false);
+            setPollTick((value) => value + 1);
+            onComplete(message);
+          }}
+          onNotice={onNotice}
+        />
+      )}
     </div>
+  );
+}
+
+function StagePollDialog({
+  onClose,
+  onComplete,
+  onNotice
+}: {
+  onClose: () => void;
+  onComplete: (message: string) => void;
+  onNotice: (message: string, tone?: "success" | "error") => void;
+}) {
+  const [stage, setStage] = useState<"bind" | "repost" | "claim">("bind");
+  const [limit, setLimit] = useState(10);
+  const [preview, setPreview] = useState<StagePollRequeueResult | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (apply: boolean) => {
+    setBusy(true);
+    try {
+      const result = await api.requeueStagePolls({ stage, limit, apply });
+      setPreview(result);
+      if (apply) {
+        onComplete(`已重新入队 ${result.requeued} 个${kindLabel(stage)}状态轮询`);
+      }
+    } catch (error) {
+      onNotice(toMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog title="批量轮询等待任务" onClose={onClose}>
+      <div className="dialog-form">
+        <div className="workflow-header">
+          <label>
+            <span>阶段</span>
+            <select
+              value={stage}
+              onChange={(event) => {
+                setStage(event.target.value as "bind" | "repost" | "claim");
+                setPreview(null);
+              }}
+            >
+              <option value="bind">绑定地址</option>
+              <option value="repost">转发推文</option>
+              <option value="claim">领取奖励</option>
+            </select>
+          </label>
+          <label>
+            <span>数量上限</span>
+            <input
+              type="number"
+              min={1}
+              max={500}
+              value={limit}
+              onChange={(event) => {
+                setLimit(Number(event.target.value) || 1);
+                setPreview(null);
+              }}
+            />
+          </label>
+        </div>
+        {preview && (
+          <div className="preview-summary">
+            <span>选中 {preview.selected}</span>
+            <span>已入队 {preview.requeued}</span>
+            <span>缺少引用 {preview.skipped_missing_ref}</span>
+          </div>
+        )}
+        <p className="form-hint">
+          只处理已经有外部引用的等待任务。下一轮 worker 会读取外部状态，不重新发起该阶段动作。
+        </p>
+        <div className="dialog-actions">
+          <Button onClick={onClose}>取消</Button>
+          <Button onClick={() => void submit(false)} disabled={busy}>
+            {busy ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}
+            预览
+          </Button>
+          <Button
+            tone="primary"
+            onClick={() => void submit(true)}
+            disabled={busy || !preview || preview.selected === 0}
+          >
+            {busy ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
+            重新入队
+          </Button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+function BindStatusSyncDialog({
+  onClose,
+  onComplete,
+  onNotice
+}: {
+  onClose: () => void;
+  onComplete: (message: string) => void;
+  onNotice: (message: string, tone?: "success" | "error") => void;
+}) {
+  const [name, setName] = useState("bind status sync");
+  const [limit, setLimit] = useState(10);
+  const [dispatchLimit, setDispatchLimit] = useState(10);
+  const [preview, setPreview] = useState<BindStatusSyncResult | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (apply: boolean) => {
+    setBusy(true);
+    try {
+      const result = await api.bindStatusSync({
+        name,
+        limit,
+        dispatch_limit: dispatchLimit,
+        apply
+      });
+      setPreview(result);
+      if (apply) {
+        onComplete(`已创建 ${result.created_jobs} 个绑定状态同步任务`);
+      }
+    } catch (error) {
+      onNotice(toMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog title="同步绑定状态" onClose={onClose}>
+      <div className="dialog-form">
+        <div className="workflow-header">
+          <label>
+            <span>批次名称</span>
+            <input
+              value={name}
+              onChange={(event) => {
+                setName(event.target.value);
+                setPreview(null);
+              }}
+            />
+          </label>
+          <label>
+            <span>数量上限</span>
+            <input
+              type="number"
+              min={1}
+              max={500}
+              value={limit}
+              onChange={(event) => {
+                setLimit(Number(event.target.value) || 1);
+                setPreview(null);
+              }}
+            />
+          </label>
+          <label>
+            <span>并发窗口</span>
+            <input
+              type="number"
+              min={1}
+              max={32}
+              value={dispatchLimit}
+              onChange={(event) => {
+                setDispatchLimit(Number(event.target.value) || 1);
+                setPreview(null);
+              }}
+            />
+          </label>
+        </div>
+        {preview && (
+          <div className="preview-summary">
+            <span>Pending {preview.pending_bindings}</span>
+            <span>选中 {preview.selected}</span>
+            <span>新建 {preview.created_jobs}</span>
+            <span>复用 {preview.reused_jobs}</span>
+            <span>暂停首绑 {preview.paused_action_jobs}</span>
+            <span>已有状态任务 {preview.skipped_existing_status_job}</span>
+            <span>租约跳过 {preview.skipped_active_lease}</span>
+            <span>缺密钥 {preview.skipped_missing_secret}</span>
+          </div>
+        )}
+        <p className="form-hint">
+          只为 pending 绑定创建 Kredo 任务状态读取，不重新打开 X OAuth。已有未执行的首绑任务会暂停，避免重复点击绑定。
+        </p>
+        <div className="dialog-actions">
+          <Button onClick={onClose}>取消</Button>
+          <Button onClick={() => void submit(false)} disabled={busy || !name.trim()}>
+            {busy ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}
+            预览
+          </Button>
+          <Button
+            tone="primary"
+            onClick={() => void submit(true)}
+            disabled={busy || !preview || preview.selected === 0 || !name.trim()}
+          >
+            {busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
+            入队同步
+          </Button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+function StageRetryDialog({
+  onClose,
+  onComplete,
+  onNotice
+}: {
+  onClose: () => void;
+  onComplete: (message: string) => void;
+  onNotice: (message: string, tone?: "success" | "error") => void;
+}) {
+  const [stage, setStage] = useState<"verify" | "bind" | "repost" | "claim">("bind");
+  const [limit, setLimit] = useState(10);
+  const [preview, setPreview] = useState<StageRetryResult | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (apply: boolean) => {
+    setBusy(true);
+    try {
+      const result = await api.retryStageFailures({ stage, limit, apply });
+      setPreview(result);
+      if (apply) {
+        onComplete(`已重试 ${result.retried} 个${kindLabel(stage)}失败任务`);
+      }
+    } catch (error) {
+      onNotice(toMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog title="批量重试失败任务" onClose={onClose}>
+      <div className="dialog-form">
+        <div className="workflow-header">
+          <label>
+            <span>阶段</span>
+            <select
+              value={stage}
+              onChange={(event) => {
+                setStage(event.target.value as "verify" | "bind" | "repost" | "claim");
+                setPreview(null);
+              }}
+            >
+              <option value="verify">校验账号</option>
+              <option value="bind">绑定地址</option>
+              <option value="repost">转发推文</option>
+              <option value="claim">领取奖励</option>
+            </select>
+          </label>
+          <label>
+            <span>数量上限</span>
+            <input
+              type="number"
+              min={1}
+              max={500}
+              value={limit}
+              onChange={(event) => {
+                setLimit(Number(event.target.value) || 1);
+                setPreview(null);
+              }}
+            />
+          </label>
+        </div>
+        {preview && (
+          <div className="preview-summary">
+            <span>选中 {preview.selected}</span>
+            <span>已重试 {preview.retried}</span>
+          </div>
+        )}
+        <p className="form-hint">
+          只处理该阶段已经失败的任务。重试会保留原任务事件链并增加尝试次数，不创建新的绑定关系。
+        </p>
+        <div className="dialog-actions">
+          <Button onClick={onClose}>取消</Button>
+          <Button onClick={() => void submit(false)} disabled={busy}>
+            {busy ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}
+            预览
+          </Button>
+          <Button
+            tone="primary"
+            onClick={() => void submit(true)}
+            disabled={busy || !preview || preview.selected === 0}
+          >
+            {busy ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}
+            重试
+          </Button>
+        </div>
+      </div>
+    </Dialog>
   );
 }
 
@@ -2194,11 +2879,16 @@ function WalletImportDialog({
   const [preview, setPreview] = useState<WalletPreview | null>(null);
   const [busy, setBusy] = useState(false);
   const input = { source_type: sourceType, secret, label, start_index: startIndex, count };
+  const privateKeyInput = { content: secret, label_prefix: label };
 
   const previewWallet = async () => {
     setBusy(true);
     try {
-      setPreview(await api.previewWallet(input));
+      setPreview(
+        sourceType === "private_key"
+          ? await api.previewPrivateKeyBatch(privateKeyInput)
+          : await api.previewWallet(input)
+      );
     } catch (error) {
       onNotice(toMessage(error), "error");
     } finally {
@@ -2208,7 +2898,9 @@ function WalletImportDialog({
   const commit = async () => {
     setBusy(true);
     try {
-      const result = await api.commitWallet(input);
+      const result = sourceType === "private_key"
+        ? await api.commitPrivateKeyBatch(privateKeyInput)
+        : await api.commitWallet(input);
       onComplete(`已写入 ${result.summary.committed} 个地址`);
     } catch (error) {
       onNotice(toMessage(error), "error");
@@ -2244,12 +2936,13 @@ function WalletImportDialog({
       </div>
       <div className="form-grid">
         <label className="span-all">
-          <span>{sourceType === "private_key" ? "私钥" : "助记词"}</span>
+          <span>{sourceType === "private_key" ? "私钥（一行一个）" : "助记词"}</span>
           <textarea
             value={secret}
             onChange={(event) => setSecret(event.target.value)}
-            rows={sourceType === "private_key" ? 3 : 4}
+            rows={sourceType === "private_key" ? 8 : 4}
             spellCheck={false}
+            placeholder={sourceType === "private_key" ? "0x...\n0x...\n# 可用 # 写注释行" : ""}
           />
         </label>
         <label>
@@ -2328,11 +3021,17 @@ function BindDialog({
     if (!walletId) return;
     setBusy(true);
     try {
-      const binding = await api.createBinding(account.id, walletId);
-      await api.createTask({
-        kind: "bind",
-        binding_id: binding.id,
-        external_target: target
+      await api.createStageBatch({
+        name: `绑定 @${account.handle}`,
+        stage: "bind",
+        dispatch_limit: 1,
+        items: [
+          {
+            social_account_id: account.id,
+            wallet_id: walletId,
+            external_target: target
+          }
+        ]
       });
       onComplete(`已创建 @${account.handle} 的绑定任务`);
     } catch (error) {
@@ -2617,6 +3316,183 @@ function WorkflowDialog({
   );
 }
 
+const pairedBindStatusLabels: Record<string, string> = {
+  selected: "可创建",
+  binding_in_progress: "绑定中",
+  already_bound: "已绑定",
+  account_not_imported: "账号未导入",
+  wallet_not_imported: "地址未导入",
+  account_not_healthy: "会话未通过",
+  duplicate_account_in_file: "账号重复",
+  duplicate_wallet_in_file: "地址重复",
+  malformed_account_row: "账号格式错误",
+  missing_account_row: "缺账号行",
+  missing_wallet_row: "缺私钥行",
+  account_session_conflict: "会话冲突",
+  resource_leased: "资源占用",
+  over_limit: "超过上限"
+};
+
+function PairedBindDialog({
+  onClose,
+  onComplete,
+  onNotice
+}: {
+  onClose: () => void;
+  onComplete: (message: string) => void;
+  onNotice: (message: string, tone?: "success" | "error") => void;
+}) {
+  const [accountsContent, setAccountsContent] = useState("");
+  const [privateKeysContent, setPrivateKeysContent] = useState("");
+  const [name, setName] = useState(`文件配对绑定 ${new Date().toLocaleDateString("zh-CN")}`);
+  const [limit, setLimit] = useState(10);
+  const [dispatchLimit, setDispatchLimit] = useState(10);
+  const [includeUnverified, setIncludeUnverified] = useState(false);
+  const [preview, setPreview] = useState<PairedBindResult | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const requestBody = (apply: boolean) => ({
+    accounts_content: accountsContent,
+    private_keys_content: privateKeysContent,
+    name,
+    limit,
+    dispatch_limit: dispatchLimit,
+    include_unverified: includeUnverified,
+    apply
+  });
+
+  const run = async (apply: boolean) => {
+    if (!accountsContent.trim() || !privateKeysContent.trim() || !name.trim()) return;
+    setBusy(true);
+    try {
+      const result = await api.pairedBind(requestBody(apply));
+      setPreview(result);
+      if (apply) {
+        onComplete(`已创建 ${result.created_jobs} 个按行配对绑定任务`);
+      }
+    } catch (error) {
+      onNotice(toMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog title="文件配对绑定" onClose={onClose} wide>
+      <div className="dialog-form">
+        <div className="workflow-header">
+          <label>
+            <span>批次名称</span>
+            <input value={name} onChange={(event) => setName(event.target.value)} required />
+          </label>
+          <label>
+            <span>最多创建</span>
+            <input
+              type="number"
+              min={1}
+              max={500}
+              value={limit}
+              onChange={(event) => setLimit(Number(event.target.value) || 1)}
+              required
+            />
+          </label>
+          <label>
+            <span>并发窗口</span>
+            <input
+              type="number"
+              min={1}
+              max={32}
+              value={dispatchLimit}
+              onChange={(event) => setDispatchLimit(Number(event.target.value) || 1)}
+              required
+            />
+          </label>
+        </div>
+        <div className="two-column-form">
+          <label>
+            <span>账号 TSV</span>
+            <textarea
+              rows={10}
+              value={accountsContent}
+              onChange={(event) => {
+                setAccountsContent(event.target.value);
+                setPreview(null);
+              }}
+              placeholder="登录账号	密码	2FA	邮箱	邮箱密码	token	Cookie"
+            />
+          </label>
+          <label>
+            <span>私钥（一行一个）</span>
+            <textarea
+              rows={10}
+              value={privateKeysContent}
+              onChange={(event) => {
+                setPrivateKeysContent(event.target.value);
+                setPreview(null);
+              }}
+              placeholder="0x..."
+            />
+          </label>
+        </div>
+        <label className="inline-check">
+          <input
+            type="checkbox"
+            checked={includeUnverified}
+            onChange={(event) => {
+              setIncludeUnverified(event.target.checked);
+              setPreview(null);
+            }}
+          />
+          <span>允许未校验通过的账号进入绑定批次</span>
+        </label>
+        {preview && (
+          <div className="import-preview">
+            <div className="preview-summary">
+              <span>{preview.total_pairs} 行配对</span>
+              <span className="success-text">{preview.selected_pairs} 可创建</span>
+              <span>{preview.created_jobs} 已创建</span>
+              <span>{preview.apply ? "已应用" : "仅预览"}</span>
+            </div>
+            <div className="preview-rows compact-preview-grid">
+              {Object.entries(preview.counts).map(([status, count]) => (
+                <div key={status}>
+                  <strong>{pairedBindStatusLabels[status] ?? status}</strong>
+                  <span>{count}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        <p className="form-hint">第 N 行账号只会配第 N 行私钥；跳过行不会挤压后续配对。</p>
+        <div className="dialog-actions">
+          <Button onClick={onClose}>取消</Button>
+          <Button
+            onClick={() => void run(false)}
+            disabled={busy || !accountsContent.trim() || !privateKeysContent.trim() || !name.trim()}
+          >
+            {busy ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}
+            预览
+          </Button>
+          <Button
+            tone="primary"
+            onClick={() => void run(true)}
+            disabled={
+              busy ||
+              !accountsContent.trim() ||
+              !privateKeysContent.trim() ||
+              !name.trim() ||
+              (preview !== null && preview.selected_pairs === 0)
+            }
+          >
+            {busy ? <LoaderCircle className="spin" size={16} /> : <Link2 size={16} />}
+            创建绑定任务
+          </Button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
 function OperationDialog({
   kind,
   bindingIds,
@@ -2630,7 +3506,7 @@ function OperationDialog({
   onComplete: (message: string) => void;
   onNotice: (message: string, tone?: "success" | "error") => void;
 }) {
-  const [target, setTarget] = useState("");
+  const [target, setTarget] = useState(kind === "claim" ? "kredo:claim" : "");
   const [name, setName] = useState(`${kind === "repost" ? "转发" : "领取"} ${new Date().toLocaleDateString("zh-CN")}`);
   const [busy, setBusy] = useState(false);
   const isBatch = bindingIds.length > 1;
@@ -2638,21 +3514,20 @@ function OperationDialog({
     event.preventDefault();
     setBusy(true);
     try {
-      if (isBatch) {
-        await api.createBatch({
-          name,
-          kind,
-          dispatch_limit: 10,
-          items: bindingIds.map((bindingId) => ({
-            binding_id: bindingId,
-            external_target: target
-          }))
-        });
-        onComplete(`已创建 ${bindingIds.length} 项${kind === "repost" ? "转发" : "领取"}批次`);
-      } else {
-        await api.createTask({ kind, binding_id: bindingIds[0], external_target: target });
-        onComplete(`已创建${kind === "repost" ? "转发" : "领取"}任务`);
-      }
+      await api.createStageBatch({
+        name,
+        stage: kind,
+        dispatch_limit: 10,
+        items: bindingIds.map((bindingId) => ({
+          binding_id: bindingId,
+          external_target: target
+        }))
+      });
+      onComplete(
+        isBatch
+          ? `已创建 ${bindingIds.length} 项${kind === "repost" ? "转发" : "领取"}批次`
+          : `已创建${kind === "repost" ? "转发" : "领取"}任务`
+      );
     } catch (error) {
       onNotice(toMessage(error), "error");
     } finally {

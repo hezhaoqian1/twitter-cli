@@ -150,13 +150,19 @@ def test_wallet_http_flow_uses_shared_vault_and_redacts_secret_material() -> Non
     Base.metadata.create_all(engine)
     from manager_api.api.routers.vault import initialize_vault, lock_vault
     from manager_api.api.routers.wallets import (
+        commit_private_key_batch,
         commit_wallet_source,
         derive_wallet_source,
         list_wallets,
+        preview_private_key_batch,
     )
     from manager_api.config import ManagerSettings
     from manager_api.schemas.vault import VaultInitializeRequest
-    from manager_api.schemas.wallets import WalletDeriveRequest, WalletImportRequest
+    from manager_api.schemas.wallets import (
+        WalletDeriveRequest,
+        WalletImportRequest,
+        WalletPrivateKeysRequest,
+    )
 
     app = create_app(
         ManagerSettings(
@@ -167,6 +173,7 @@ def test_wallet_http_flow_uses_shared_vault_and_redacts_secret_material() -> Non
     )
     runtime = app.state.vault_runtime
     assert "/api/wallet-sources" in app.openapi()["paths"]
+    assert "/api/wallet-sources/private-keys" in app.openapi()["paths"]
     assert "/api/wallets" in app.openapi()["paths"]
 
     with Session(engine) as session:
@@ -200,6 +207,33 @@ def test_wallet_http_flow_uses_shared_vault_and_redacts_secret_material() -> Non
         source_id = commit.source_id
     assert source_id is not None
 
+    private_key_a = "59c6995e998f97a5a0044966f094538b292d4874067f2f3f2d8f3f3e8f5f7f8f"
+    private_key_b = "5de4111afa1a4b6ea2ba7c5d3c587a1efde46fb7f8d8eb21d6cd7b3e7f09a1b1"
+    private_key_content = f"{private_key_a}\n0x{private_key_b.upper()}\n"
+    with Session(engine) as session:
+        vault = VaultService(session, runtime=runtime)
+        preview_private = preview_private_key_batch(
+            WalletPrivateKeysRequest(
+                content=SecretStr(private_key_content),
+                label_prefix="api-private",
+            ),
+            session=session,
+        )
+        committed_private = commit_private_key_batch(
+            WalletPrivateKeysRequest(
+                content=SecretStr(private_key_content),
+                label_prefix="api-private",
+            ),
+            session=session,
+            vault=vault,
+        )
+        session.commit()
+        assert preview_private.summary.valid == 2
+        assert committed_private.summary.committed == 2
+        assert committed_private.source_id is None
+        assert private_key_a not in committed_private.model_dump_json()
+        assert private_key_b not in committed_private.model_dump_json()
+
     with Session(engine) as session:
         vault = VaultService(session, runtime=runtime)
         derived = derive_wallet_source(
@@ -212,8 +246,8 @@ def test_wallet_http_flow_uses_shared_vault_and_redacts_secret_material() -> Non
         assert derived.summary.committed == 1
 
         listed = list_wallets(offset=0, limit=50, session=session)
-        assert listed.total == 3
-        assert len(listed.items) == 3
+        assert listed.total == 5
+        assert len(listed.items) == 5
     assert {
         "id",
         "address",

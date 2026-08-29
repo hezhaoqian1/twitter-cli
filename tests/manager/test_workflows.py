@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -13,16 +14,16 @@ from manager_api.adapters.protocol import (
 from manager_api.db.base import Base
 from manager_api.models.accounts import AccountHealth, LifecycleState, SocialAccount
 from manager_api.models.bindings import AccountWalletBinding, BindingState
-from manager_api.models.tasks import TaskKind, TaskState
+from manager_api.models.tasks import TaskBatch, TaskKind, TaskState
 from manager_api.models.wallets import Wallet
 from manager_api.scheduler import Scheduler
 from manager_api.services.bindings import BindingService
 from manager_api.services.execution import TaskExecutionService
 from manager_api.services.imports import AccountImportService
+from manager_api.services.tasks import TaskConflictError
 from manager_api.services.vault import VaultService
 from manager_api.services.wallets import WalletService, WalletSourceType
 from manager_api.services.workflows import (
-    WorkflowBatchItem,
     WorkflowService,
     WorkflowStage,
     WorkflowStageBatchItem,
@@ -114,115 +115,6 @@ class SyntheticWorkflowKredoAdapter:
         return None
 
 
-def test_workflow_builds_four_ordered_jobs_per_pair() -> None:
-    """Each pair gets an isolated verify-bind-repost-claim dependency chain."""
-    engine = create_engine("sqlite+pysqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        pairs = [_pair(session, index) for index in range(1, 4)]
-        result = WorkflowService(session).create_batch(
-            name="Synthetic HSK run",
-            dispatch_limit=2,
-            items=[
-                WorkflowBatchItem(
-                    social_account_id=account.id,
-                    wallet_id=wallet.id,
-                    repost_target=f"https://x.test/status/{index}",
-                )
-                for index, (account, wallet) in enumerate(pairs, start=1)
-            ],
-        )
-
-        assert result.batch.workflow_type == "account_wallet"
-        assert len(result.jobs) == 3
-        for verify, bind, repost, claim in result.jobs:
-            assert verify.kind is TaskKind.VERIFY_ACCOUNT
-            assert bind.depends_on_task_id == verify.id
-            assert repost.depends_on_task_id == bind.id
-            assert claim.kind is TaskKind.CLAIM
-            assert claim.depends_on_task_id == repost.id
-            assert {verify.social_account_id, bind.social_account_id} == {repost.social_account_id}
-            assert claim.social_account_id == repost.social_account_id
-            assert verify.wallet_id is None
-            assert bind.wallet_id == repost.wallet_id
-            assert claim.wallet_id == repost.wallet_id
-
-
-def test_workflow_dispatches_in_stages_and_keeps_pairs_independent() -> None:
-    """One failed pair does not block unrelated pairs from reaching later stages."""
-    engine = create_engine("sqlite+pysqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        pairs = [_pair(session, index) for index in range(1, 4)]
-        result = WorkflowService(session).create_batch(
-            name="Independent synthetic run",
-            dispatch_limit=2,
-            items=[
-                WorkflowBatchItem(
-                    social_account_id=account.id,
-                    wallet_id=wallet.id,
-                    repost_target=f"tweet-{index}",
-                )
-                for index, (account, wallet) in enumerate(pairs, start=1)
-            ],
-        )
-        scheduler = Scheduler(
-            session,
-            worker_concurrency=2,
-            browser_concurrency=2,
-            lease_ttl_seconds=60,
-        )
-        worker = TaskWorker(session, scheduler=scheduler)
-        chains = result.jobs
-
-        # Only the first stage is eligible initially, and two pairs can run together.
-        grants = scheduler.dispatch_once(limit=2)
-        assert {grant.task_job_id for grant in grants} == {
-            chains[0][0].id,
-            chains[1][0].id,
-        }
-        for grant in grants:
-            worker.run_one(
-                grant,
-                lambda job: WorkerOutcome(
-                    state=TaskState.FAILED if job.social_account_id == chains[1][0].social_account_id else TaskState.SUCCEEDED,
-                    summary="synthetic verification",
-                    failure_code="synthetic_invalid" if job.social_account_id == chains[1][0].social_account_id else None,
-                ),
-            )
-
-        # The failed pair is explicitly blocked; the first and third pairs can advance independently.
-        grants = scheduler.dispatch_once(limit=2)
-        assert {grant.task_job_id for grant in grants} == {
-            chains[0][1].id,
-            chains[2][0].id,
-        }
-        for grant in grants:
-            if grant.task_job_id == chains[0][1].id:
-                worker.run_one(grant, lambda job: _complete_bind(session, job))
-            else:
-                worker.run_one(
-                    grant,
-                    lambda _: WorkerOutcome(
-                        state=TaskState.SUCCEEDED,
-                        summary="synthetic verification",
-                    ),
-                )
-
-        # The first pair advances to repost while the third pair waits at bind.
-        grant = scheduler.dispatch_once(limit=1)[0]
-        assert grant.task_job_id == chains[0][2].id
-        worker.run_one(
-            grant,
-            lambda _: WorkerOutcome(state=TaskState.SUCCEEDED, summary="synthetic repost"),
-        )
-
-        assert chains[0][2].state is TaskState.SUCCEEDED
-        assert chains[0][3].state is TaskState.QUEUED
-        assert chains[1][1].state is TaskState.BLOCKED
-        assert chains[2][1].state is TaskState.QUEUED
-
-
 def test_stage_batches_are_homogeneous_and_never_add_cross_stage_dependencies() -> None:
     """Each operator stage stays independently schedulable and observable."""
     engine = create_engine("sqlite+pysqlite:///:memory:")
@@ -278,6 +170,10 @@ def test_stage_batches_are_homogeneous_and_never_add_cross_stage_dependencies() 
                 for index, job in enumerate(bind.jobs, start=1)
             ],
         )
+        for job in repost.jobs:
+            job.state = TaskState.SUCCEEDED
+        session.flush()
+
         claim = service.create_stage_batch(
             name="Claim verified pairs",
             stage=WorkflowStage.CLAIM,
@@ -291,7 +187,61 @@ def test_stage_batches_are_homogeneous_and_never_add_cross_stage_dependencies() 
         assert repost.batch.workflow_type == "stage:repost"
         assert claim.batch.workflow_type == "stage:claim"
         assert all(job.depends_on_task_id is None for job in (*repost.jobs, *claim.jobs))
-        assert all(job.state is TaskState.QUEUED for job in (*verify.jobs, *bind.jobs, *repost.jobs, *claim.jobs))
+        assert all(job.state is TaskState.QUEUED for job in (*verify.jobs, *bind.jobs, *claim.jobs))
+        assert all(job.state is TaskState.SUCCEEDED for job in repost.jobs)
+
+
+def test_claim_stage_requires_successful_repost_validation() -> None:
+    """领取批次必须等转发任务成功，避免慢回写时提前领取。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        account, wallet = _pair(session, 31)
+        binding = BindingService(session).confirm(
+            BindingService(session).create_pending(account.id, wallet.id).binding.id,
+            "fixture:bound",
+        ).binding
+        service = WorkflowService(session)
+
+        with pytest.raises(TaskConflictError) as not_ready:
+            service.create_stage_batch(
+                name="early claim",
+                stage=WorkflowStage.CLAIM,
+                items=[WorkflowStageBatchItem(binding_id=binding.id, external_target="kredo:claim")],
+            )
+        assert not_ready.value.code == "claim_not_ready"
+        assert session.query(TaskBatch).count() == 0
+
+        repost = service.create_stage_batch(
+            name="repost first",
+            stage=WorkflowStage.REPOST,
+            items=[WorkflowStageBatchItem(binding_id=binding.id, external_target="tweet-31")],
+        )
+        repost.jobs[0].state = TaskState.WAITING_EXTERNAL_VALIDATION
+        session.flush()
+        with pytest.raises(TaskConflictError) as still_waiting:
+            service.create_stage_batch(
+                name="waiting claim",
+                stage=WorkflowStage.CLAIM,
+                items=[WorkflowStageBatchItem(binding_id=binding.id, external_target="kredo:claim")],
+            )
+        assert still_waiting.value.code == "claim_not_ready"
+
+        repost.jobs[0].state = TaskState.SUCCEEDED
+        session.flush()
+        claim = service.create_stage_batch(
+            name="ready claim",
+            stage=WorkflowStage.CLAIM,
+            items=[WorkflowStageBatchItem(binding_id=binding.id, external_target="kredo:claim")],
+        )
+        assert len(claim.jobs) == 1
+        with pytest.raises(TaskConflictError) as duplicate:
+            service.create_stage_batch(
+                name="duplicate claim",
+                stage=WorkflowStage.CLAIM,
+                items=[WorkflowStageBatchItem(binding_id=binding.id, external_target="kredo:claim")],
+            )
+        assert duplicate.value.code == "claim_already_exists"
 
 
 def test_failed_or_waiting_stage_jobs_do_not_block_independent_batches() -> None:
@@ -338,17 +288,8 @@ def test_failed_or_waiting_stage_jobs_do_not_block_independent_batches() -> None
         assert second.jobs[0].state is TaskState.SUCCEEDED
 
 
-def _complete_bind(session: Session, job) -> WorkerOutcome:
-    """Confirm the synthetic binding when its bind task completes."""
-    binding = session.get(AccountWalletBinding, job.binding_id)
-    if binding is not None:
-        BindingService(session).confirm(binding.id, f"synthetic:{binding.id}")
-        assert binding.state is BindingState.BOUND
-    return WorkerOutcome(state=TaskState.SUCCEEDED, summary="synthetic bind")
-
-
-def test_generated_wallets_run_the_complete_workflow_through_the_vault() -> None:
-    """生成多个本地地址并验证每个配对独立完成四阶段任务链。"""
+def test_generated_wallets_run_explicit_stage_batches_through_the_vault() -> None:
+    """生成多个本地地址，并验证每个阶段都由显式批次独立推进。"""
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
@@ -386,19 +327,16 @@ def test_generated_wallets_run_the_complete_workflow_through_the_vault() -> None
             assert wallet is not None
             wallets.append(wallet)
 
-        result = WorkflowService(session).create_batch(
-            name="Generated local workflow",
+        workflows = WorkflowService(session)
+        verify = workflows.create_stage_batch(
+            name="Generated verify stage",
+            stage=WorkflowStage.VERIFY,
             dispatch_limit=3,
             items=[
-                WorkflowBatchItem(
-                    social_account_id=account.id,
-                    wallet_id=wallet.id,
-                    repost_target=f"https://x.test/status/{index}",
-                )
-                for index, (account, wallet) in enumerate(zip(accounts, wallets), start=1)
+                WorkflowStageBatchItem(social_account_id=account.id)
+                for account in accounts
             ],
         )
-        all_jobs = [job for chain in result.jobs for job in chain]
         scheduler = Scheduler(
             session,
             worker_concurrency=3,
@@ -415,16 +353,78 @@ def test_generated_wallets_run_the_complete_workflow_through_the_vault() -> None
             kredo_adapter=kredo_adapter,
         )
 
-        for _ in range(8):
+        # 验证阶段独立完成后，并不会自动创建绑定任务。
+        for _ in range(3):
             grants = scheduler.dispatch_once(limit=3)
             if not grants:
                 break
             for grant in grants:
                 worker.run_one(grant, execution.handle)
-            if all(job.state is TaskState.SUCCEEDED for job in all_jobs):
+            if all(job.state is TaskState.SUCCEEDED for job in verify.jobs):
+                break
+        assert all(job.state is TaskState.SUCCEEDED for job in verify.jobs)
+        assert session.query(AccountWalletBinding).count() == 0
+
+        bind = workflows.create_stage_batch(
+            name="Generated bind stage",
+            stage=WorkflowStage.BIND,
+            dispatch_limit=3,
+            items=[
+                WorkflowStageBatchItem(social_account_id=account.id, wallet_id=wallet.id)
+                for account, wallet in zip(accounts, wallets, strict=False)
+            ],
+        )
+        for _ in range(3):
+            grants = scheduler.dispatch_once(limit=3)
+            if not grants:
+                break
+            for grant in grants:
+                worker.run_one(grant, execution.handle)
+            if all(job.state is TaskState.SUCCEEDED for job in bind.jobs):
+                break
+        bindings = session.query(AccountWalletBinding).order_by(AccountWalletBinding.id).all()
+        assert len(bindings) == 3
+        assert all(binding.state is BindingState.BOUND for binding in bindings)
+
+        repost = workflows.create_stage_batch(
+            name="Generated repost stage",
+            stage=WorkflowStage.REPOST,
+            dispatch_limit=3,
+            items=[
+                WorkflowStageBatchItem(
+                    binding_id=binding.id,
+                    external_target=f"https://x.test/status/{index}",
+                )
+                for index, binding in enumerate(bindings, start=1)
+            ],
+        )
+        for _ in range(3):
+            grants = scheduler.dispatch_once(limit=3)
+            if not grants:
+                break
+            for grant in grants:
+                worker.run_one(grant, execution.handle)
+            if all(job.state is TaskState.SUCCEEDED for job in repost.jobs):
                 break
 
+        claim = workflows.create_stage_batch(
+            name="Generated claim stage",
+            stage=WorkflowStage.CLAIM,
+            dispatch_limit=3,
+            items=[WorkflowStageBatchItem(binding_id=binding.id) for binding in bindings],
+        )
+        for _ in range(3):
+            grants = scheduler.dispatch_once(limit=3)
+            if not grants:
+                break
+            for grant in grants:
+                worker.run_one(grant, execution.handle)
+            if all(job.state is TaskState.SUCCEEDED for job in claim.jobs):
+                break
+
+        all_jobs = [*verify.jobs, *bind.jobs, *repost.jobs, *claim.jobs]
         assert all(job.state is TaskState.SUCCEEDED for job in all_jobs)
+        assert all(job.depends_on_task_id is None for job in all_jobs)
         assert x_adapter.verify_calls == 3
         assert x_adapter.repost_calls == 3
         assert kredo_adapter.bind_calls == 3
@@ -432,6 +432,4 @@ def test_generated_wallets_run_the_complete_workflow_through_the_vault() -> None
         assert kredo_adapter.claim_calls == 3
         assert sorted(kredo_adapter.wallet_keys) == sorted(private_keys + private_keys)
 
-        bindings = session.query(AccountWalletBinding).all()
-        assert len(bindings) == 3
         assert all(binding.state is BindingState.BOUND for binding in bindings)

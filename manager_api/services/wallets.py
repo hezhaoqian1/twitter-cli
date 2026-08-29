@@ -217,6 +217,108 @@ class WalletService:
         self.session.flush()
         return source, preview
 
+    def preview_private_keys(
+        self,
+        content: str,
+        *,
+        label_prefix: str | None = None,
+    ) -> WalletPreview:
+        """Preview many private keys from one-key-per-line operator input."""
+        candidates = self._private_key_candidates(content)
+        existing = self._existing_addresses(
+            {candidate.normalized_address for candidate in candidates}
+        )
+        seen: set[str] = set()
+        decisions: list[WalletDecision] = []
+        for candidate in candidates:
+            if candidate.normalized_address in seen:
+                decisions.append(
+                    WalletDecision(
+                        candidate=candidate,
+                        status=WalletImportStatus.DUPLICATE_IN_FILE,
+                        diagnostic_code="duplicate_address_in_file",
+                        diagnostic_detail="same normalized address appeared earlier in this request",
+                    )
+                )
+            elif candidate.normalized_address in existing:
+                decisions.append(
+                    WalletDecision(
+                        candidate=candidate,
+                        status=WalletImportStatus.DUPLICATE_EXISTING,
+                        diagnostic_code="address_already_exists",
+                        diagnostic_detail="normalized address already exists",
+                    )
+                )
+            else:
+                decisions.append(
+                    WalletDecision(candidate=candidate, status=WalletImportStatus.VALID)
+                )
+            seen.add(candidate.normalized_address)
+        return WalletPreview(
+            source_type=WalletSourceType.PRIVATE_KEY,
+            label=label_prefix,
+            start_index=0,
+            count=len(decisions),
+            decisions=decisions,
+        )
+
+    def commit_private_keys(
+        self,
+        content: str,
+        *,
+        label_prefix: str | None = None,
+    ) -> tuple[None, WalletPreview]:
+        """Encrypt and persist every valid private key from a multi-line input."""
+        preview = self.preview_private_keys(content, label_prefix=label_prefix)
+        accepted = [
+            decision
+            for decision in preview.decisions
+            if decision.status is WalletImportStatus.VALID
+        ]
+        for sequence, decision in enumerate(accepted, start=1):
+            source = WalletSource(
+                source_type=WalletSourceType.PRIVATE_KEY,
+                label=self._batch_label(label_prefix, sequence),
+                derivation_path=None,
+                encrypted_source_ref=b"pending",
+                envelope_version=1,
+            )
+            self.session.add(source)
+            self.session.flush()
+            source.encrypted_source_ref = self.vault.encrypt_field(
+                "wallet_sources",
+                source.id,
+                "source_material",
+                decision.candidate.private_key,
+            )
+            wallet = Wallet(
+                wallet_source_id=source.id,
+                address=decision.candidate.address,
+                normalized_address=decision.candidate.normalized_address,
+                derivation_path=None,
+                derivation_index=None,
+                state="active",
+            )
+            self.session.add(wallet)
+            self.session.flush()
+            wallet_secret = self._new_wallet_secret(
+                wallet.id,
+                WalletSourceType.PRIVATE_KEY,
+                decision.candidate,
+            )
+            self.session.add(wallet_secret)
+            self.session.flush()
+            wallet_secret.envelope = self.vault.encrypt_field(
+                "wallet_secrets",
+                wallet_secret.id,
+                "private_key",
+                decision.candidate.private_key,
+            )
+            decision.status = WalletImportStatus.COMMITTED
+            decision.wallet_id = wallet.id
+        self.session.flush()
+        return None, preview
+
     def derive(
         self,
         source_id: UUID,
@@ -346,6 +448,47 @@ class WalletService:
         if not account.address:
             raise WalletInputError("private key is invalid")
         return candidate.lower()
+
+    @staticmethod
+    def _private_key_candidates(content: str) -> list[WalletCandidate]:
+        """Parse one-key-per-line input into validated wallet candidates."""
+        lines = [
+            (line_number, raw_line.strip())
+            for line_number, raw_line in enumerate(content.splitlines(), start=1)
+            if raw_line.strip() and not raw_line.strip().startswith("#")
+        ]
+        if not lines:
+            raise WalletInputError("private key list must contain at least one key")
+        if len(lines) > 500:
+            raise WalletInputError("private key list can contain at most 500 keys")
+        candidates: list[WalletCandidate] = []
+        for line_number, value in lines:
+            try:
+                normalized = WalletService._validate_private_key(value)
+                candidate = WalletService._candidates(
+                    WalletSourceType.PRIVATE_KEY,
+                    normalized,
+                    start_index=0,
+                    count=1,
+                )[0]
+            except WalletInputError as exc:
+                raise WalletInputError(f"line {line_number}: {exc}") from exc
+            candidates.append(
+                WalletCandidate(
+                    index=line_number,
+                    address=candidate.address,
+                    normalized_address=candidate.normalized_address,
+                    derivation_path=None,
+                    private_key=candidate.private_key,
+                )
+            )
+        return candidates
+
+    @staticmethod
+    def _batch_label(label_prefix: str | None, sequence: int) -> str | None:
+        """Build a stable per-key label without including source material."""
+        prefix = label_prefix.strip() if label_prefix else ""
+        return f"{prefix}-{sequence}" if prefix else None
 
     @staticmethod
     def _validate_mnemonic(secret: str) -> str:

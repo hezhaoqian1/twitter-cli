@@ -17,6 +17,7 @@ TRANSACTION_KEYWORDS = ("permit", "approve", "allowance", "transfer")
 KREDO_HOME = "https://www.kredo.fun/"
 KREDO_TASKS = "https://www.kredo.fun/tasks"
 KREDO_API_PREFIX = "https://api.kredo.fun/api/v1/"
+KREDO_TASK_STATE_ENDPOINTS = ("tasks/twitter", "tasks/overview")
 TWITTER_COOKIE_FILE_ENV = "TWITTER_COOKIE_FILE"
 SENSITIVE_QUERY_KEYS = {
     "code",
@@ -174,6 +175,70 @@ def _latest_task_state(api_responses: list[dict[str, object]]) -> dict[str, obje
     return None
 
 
+def _fetch_task_state_from_api(
+    page: Any,
+    api_responses: list[dict[str, object]],
+) -> dict[str, object] | None:
+    """在已登录页面上下文中直接读取 Kredo 任务接口状态。"""
+    for endpoint in KREDO_TASK_STATE_ENDPOINTS:
+        url = f"{KREDO_API_PREFIX}{endpoint}"
+        path = urlparse(url).path
+        try:
+            response = page.evaluate(
+                """async (url) => {
+                  const response = await fetch(url, {
+                    credentials: "include",
+                    headers: { "accept": "application/json" }
+                  });
+                  let payload = null;
+                  try {
+                    payload = await response.json();
+                  } catch {
+                    payload = { body: "[non-json]" };
+                  }
+                  return { status: response.status, payload };
+                }""",
+                url,
+            )
+        except Exception:
+            api_responses.append(
+                {
+                    "status": 0,
+                    "path": path,
+                    "payload": {
+                        "success": False,
+                        "error": {"code": "browser_fetch_failed"},
+                    },
+                }
+            )
+            continue
+        if not isinstance(response, dict):
+            continue
+        payload = response.get("payload")
+        api_responses.append(
+            {
+                "status": int(response.get("status") or 0),
+                "path": path,
+                "payload": _unwrap_api_payload(payload),
+            }
+        )
+        state = _task_state_from_payload(payload)
+        if state is not None:
+            return state
+    return None
+
+
+def _read_task_state(
+    page: Any,
+    api_responses: list[dict[str, object]],
+) -> dict[str, object] | None:
+    """优先使用 Kredo 后端接口状态，页面按钮只用于触发前端刷新。"""
+    return _latest_task_state(api_responses) or _fetch_task_state_from_api(
+        page,
+        api_responses,
+    )
+
+
 def _load_x_cookies(path: Path) -> list[dict[str, object]]:
     """读取已有 X 会话文件，不在输出中暴露 Cookie 值。"""
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -197,6 +262,19 @@ def _load_x_cookies(path: Path) -> list[dict[str, object]]:
     if not any(item["name"] == "auth_token" for item in cookies):
         raise ValueError("X session file is missing auth_token")
     return cookies
+
+
+def _launch_chromium(playwright: Any, *, headed: bool) -> Any:
+    """优先使用本机 Chrome，失败时回退到 Playwright 管理的 Chromium。"""
+    channel = os.environ.get("KREDO_BROWSER_CHANNEL", "chrome").strip()
+    launch_options = {"headless": not headed}
+    if channel:
+        try:
+            return playwright.chromium.launch(channel=channel, **launch_options)
+        except Exception:
+            if os.environ.get("KREDO_BROWSER_STRICT_CHANNEL", "").strip():
+                raise
+    return playwright.chromium.launch(**launch_options)
 
 
 def _click_first_visible(page: Any, labels: tuple[str, ...]) -> str | None:
@@ -255,6 +333,20 @@ def _click_authorize_button(page: Any, timeout_ms: int = 20_000) -> str | None:
             pass
         page.wait_for_timeout(250)
     return None
+
+
+def _open_task_modal(page: Any) -> bool:
+    """打开任务弹窗以触发 Kredo 前端重新读取任务状态。"""
+    try:
+        return (
+            _click_first_visible(
+                page,
+                ("去完成", "前往 X", "Go to X", "Start"),
+            )
+            is not None
+        )
+    except Exception:
+        return False
 
 
 def _is_api_response(url: str, suffix: str) -> bool:
@@ -488,7 +580,9 @@ def run(
     timeout: int,
     x_cookie_file: Path | None = None,
     bind_twitter: bool = True,
+    wait_for_task_state: bool = True,
     repost: bool = False,
+    repost_target: str = "",
     claim: bool = False,
     headed: bool = False,
     keep_open: bool = False,
@@ -499,7 +593,7 @@ def run(
 
     wallet = LocalWallet(private_key)
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(channel="chrome", headless=not headed)
+        browser = _launch_chromium(playwright, headed=headed)
         context = browser.new_context(viewport={"width": 1440, "height": 1000})
         if x_cookie_file:
             context.add_cookies(_load_x_cookies(x_cookie_file))
@@ -631,16 +725,7 @@ def run(
         if logged_in and (bind_twitter or repost or claim or status_only):
             page.goto(KREDO_TASKS, wait_until="networkidle", timeout=60_000)
             page.wait_for_timeout(1000)
-            try:
-                task_modal_opened = (
-                    _click_first_visible(
-                        page,
-                        ("去完成", "前往 X", "Go to X", "Start"),
-                    )
-                    is not None
-                )
-            except Exception:
-                pass
+            task_modal_opened = _open_task_modal(page)
             if task_modal_opened and bind_twitter and not repost and not claim and not status_only:
                 # 第二层按钮才会触发 bind API，并同步创建 OAuth popup。
                 bind_label: str | None = None
@@ -710,25 +795,47 @@ def run(
                 if authorize_url:
                     clicked = _click_authorize_button(page)
                     if clicked:
-                        # 授权页不会立即关闭，等待它进入 Kredo callback、任务页或明确错误状态。
-                        oauth_deadline = time.time() + max(15, min(timeout, 90))
-                        oauth_completion = "pending"
-                        while time.time() < oauth_deadline:
-                            is_closed = page.is_closed()
-                            current_url = "" if is_closed else page.url
-                            final_task_url = _latest_kredo_tasks_url(oauth_pages)
-                            if redirects:
-                                # callback 通常是 302，popup 可能短暂停留在 X URL；
-                                # 先记录 callback，再等待任意标签页落到任务页。
-                                oauth_completion = "kredo_tasks" if final_task_url else "kredo_callback"
-                            else:
-                                oauth_completion = _oauth_url_state(current_url, is_closed)
-                            if oauth_completion != "pending":
-                                if oauth_completion != "kredo_callback" or final_task_url:
+                        # 快速模式只需要确认授权动作已发出即可，避免慢回写拖住 worker 租约。
+                        if wait_for_task_state:
+                            oauth_deadline = time.time() + max(15, min(timeout, 90))
+                            oauth_completion = "pending"
+                            while time.time() < oauth_deadline:
+                                is_closed = page.is_closed()
+                                current_url = "" if is_closed else page.url
+                                final_task_url = _latest_kredo_tasks_url(oauth_pages)
+                                if redirects:
+                                    # callback 通常是 302，popup 可能短暂停留在 X URL；
+                                    # 先记录 callback，再等待任意标签页落到任务页。
+                                    oauth_completion = "kredo_tasks" if final_task_url else "kredo_callback"
+                                else:
+                                    oauth_completion = _oauth_url_state(current_url, is_closed)
+                                if oauth_completion != "pending":
+                                    if oauth_completion != "kredo_callback" or final_task_url:
+                                        break
+                                page.wait_for_timeout(250)
+                            if oauth_completion == "pending":
+                                oauth_completion = "timeout"
+                        else:
+                            oauth_completion = "pending"
+                            # 快速绑定不等待 Kredo 任务状态，但仍短暂确认 OAuth
+                            # 是否离开授权页，避免把未完成点击误当作慢回写。
+                            oauth_deadline = time.time() + min(8, max(3, timeout))
+                            while time.time() < oauth_deadline:
+                                is_closed = page.is_closed()
+                                current_url = "" if is_closed else page.url
+                                final_task_url = _latest_kredo_tasks_url(oauth_pages)
+                                if redirects:
+                                    oauth_completion = (
+                                        "kredo_tasks" if final_task_url else "kredo_callback"
+                                    )
                                     break
-                            page.wait_for_timeout(250)
-                        if oauth_completion == "pending":
-                            oauth_completion = "timeout"
+                                oauth_completion = _oauth_url_state(current_url, is_closed)
+                                if oauth_completion != "pending":
+                                    break
+                                page.wait_for_timeout(250)
+                            if oauth_completion == "pending":
+                                oauth_completion = "authorize_not_completed"
+                            final_task_url = final_task_url or _latest_kredo_tasks_url(oauth_pages)
                     else:
                         oauth_completion = _oauth_url_state(page.url, page.is_closed())
                     callback_url = "" if page.is_closed() else page.url
@@ -753,26 +860,29 @@ def run(
             # 授权 popup 可能在回调后关闭，任务状态始终从主任务页读取。
             status_page = task_page
             # 回调完成后后端和任务卡存在短暂最终一致性，不能只读一次。
-            status_deadline = time.time() + max(10, min(timeout, 60))
-            while time.time() < status_deadline:
-                status_page.goto(KREDO_TASKS, wait_until="domcontentloaded", timeout=60_000)
-                status_page.wait_for_timeout(1200)
-                task_state = _latest_task_state(api_responses)
-                if task_state and (
-                    task_state.get("status") == "bound"
-                    or task_state.get("repostVerified") is True
-                ):
-                    break
-                status_page.wait_for_timeout(1000)
+            if wait_for_task_state:
+                status_deadline = time.time() + max(10, min(timeout, 60))
+                while time.time() < status_deadline:
+                    status_page.goto(KREDO_TASKS, wait_until="domcontentloaded", timeout=60_000)
+                    status_page.wait_for_timeout(1200)
+                    task_modal_opened = _open_task_modal(status_page) or task_modal_opened
+                    status_page.wait_for_timeout(1200)
+                    task_state = _read_task_state(status_page, api_responses)
+                    if task_state and (
+                        task_state.get("status") == "bound"
+                        or task_state.get("repostVerified") is True
+                    ):
+                        break
+                    status_page.wait_for_timeout(1000)
 
         if logged_in and repost:
             # 绑定完成后只读取官方推文并执行一次转发，避免重复转发。
-            tweet_url = str((task_state or {}).get("tweetUrl") or "")
+            tweet_url = repost_target.strip() or str((task_state or {}).get("tweetUrl") or "")
             status_page = task_page
             if not tweet_url:
                 status_page.goto(KREDO_TASKS, wait_until="domcontentloaded", timeout=60_000)
                 status_page.wait_for_timeout(1500)
-                task_state = _latest_task_state(api_responses) or task_state
+                task_state = _read_task_state(status_page, api_responses) or task_state
                 tweet_url = str((task_state or {}).get("tweetUrl") or "")
                 if not tweet_url:
                     tweet_url = _find_tweet_url(status_page)
@@ -780,25 +890,32 @@ def run(
                 repost_result = _repost_tweet(status_page, tweet_url)
                 # Kredo 校验也有异步延迟，回到任务页等待最终状态。
                 verify_deadline = time.time() + max(10, min(timeout, 90))
-                while time.time() < verify_deadline:
+                while wait_for_task_state and time.time() < verify_deadline:
                     status_page.goto(
                         KREDO_TASKS,
                         wait_until="domcontentloaded",
                         timeout=60_000,
                     )
                     status_page.wait_for_timeout(1200)
-                    task_state = _latest_task_state(api_responses) or task_state
+                    task_state = _read_task_state(status_page, api_responses) or task_state
                     if task_state and task_state.get("repostVerified") is True:
                         break
                     status_page.wait_for_timeout(1500)
             else:
                 repost_result = {"status": "tweet_url_missing"}
 
+        if logged_in and headed and keep_open and not claim:
+            # 半自动工作台最终停在 Kredo 任务页，方便人工绑定或领取。
+            task_page.goto(KREDO_TASKS, wait_until="domcontentloaded", timeout=60_000)
+            task_page.wait_for_timeout(1200)
+            task_modal_opened = _open_task_modal(task_page) or task_modal_opened
+            task_state = _read_task_state(task_page, api_responses) or task_state
+
         if claim:
             status_page = task_page
             status_page.goto(KREDO_TASKS, wait_until="domcontentloaded", timeout=60_000)
             status_page.wait_for_timeout(1200)
-            task_state = _latest_task_state(api_responses) or task_state
+            task_state = _read_task_state(status_page, api_responses) or task_state
             claim_clicked = _click_first_visible_containing(
                 status_page,
                 (
@@ -818,7 +935,7 @@ def run(
                 while time.time() < claim_deadline:
                     status_page.goto(KREDO_TASKS, wait_until="domcontentloaded", timeout=60_000)
                     status_page.wait_for_timeout(1200)
-                    task_state = _latest_task_state(api_responses) or task_state
+                    task_state = _read_task_state(status_page, api_responses) or task_state
                     current_status = str((task_state or {}).get("status") or "")
                     if current_status in {"claimed", "complete", "completed"}:
                         claim_result = {"status": "claimed", "button": claim_clicked}
@@ -901,8 +1018,10 @@ def main() -> int:
         help="只验证钱包登录，不启动 X 绑定",
     )
     parser.add_argument("--repost", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--repost-target", default="", help=argparse.SUPPRESS)
     parser.add_argument("--claim", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--status-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--no-wait-task-state", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     private_key = os.environ.get("KREDO_PRIVATE_KEY", "")
@@ -915,7 +1034,9 @@ def main() -> int:
         args.timeout,
         x_cookie_file=args.twitter_cookie_file,
         bind_twitter=not args.no_bind_twitter,
+        wait_for_task_state=not args.no_wait_task_state,
         repost=args.repost,
+        repost_target=args.repost_target,
         claim=args.claim,
         headed=args.headed,
         keep_open=args.keep_open,

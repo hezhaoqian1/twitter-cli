@@ -152,7 +152,7 @@ https://www.kredo.fun/tasks?twitter=failed
 ```
 
 The later headed run showed the X consent page, and manually reopening the task
-modal after a short delay displayed `MakylaGaylord 已绑定`. This confirms that
+modal after a short delay displayed a bound fixture handle. This confirms that
 the callback can finish before the task card updates. A single immediate read
 of `unbound` is therefore not conclusive; the probe must keep reloading the
 task page and polling the task detail or overview response.
@@ -226,6 +226,13 @@ old state. Reopening the task modal or refreshing the task page causes the
 latest `twitterQuest` state to appear. The probe now polls for up to 60 seconds
 and reads both `/tasks/twitter` and `/tasks/overview` so this UI delay does not
 become a false failure.
+
+The manager should judge bind acceptance from the interface state, not from
+whether a human sees the button text change immediately. The operator overview
+calls `GET /api/runtime/acceptance-audit`, which rolls up pollable callbacks,
+syncable pending bindings, retryable failures, and the next action. A manual
+headed browser session is still useful for debugging OAuth popups, but it is
+not the batch source of truth.
 
 Run it with:
 

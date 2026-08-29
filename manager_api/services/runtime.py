@@ -24,6 +24,7 @@ from ..schemas.runtime import (
     RuntimeTaskMetrics,
     RuntimeWorkerMetrics,
 )
+from .bind_status_sync import queue_bind_status_sync
 
 
 class RuntimeRedisClient(Protocol):
@@ -169,6 +170,22 @@ def collect_operations_summary(
     pending_bindings = sum(1 for binding in active_bindings if binding.state is BindingState.PENDING)
     waiting_tasks = _task_counts_by_kind(session, TaskState.WAITING_EXTERNAL_VALIDATION)
     failed_tasks = _task_counts_by_kind(session, TaskState.FAILED)
+    pollable_tasks = _pollable_task_counts_by_kind(session)
+    bind_status_syncable = queue_bind_status_sync(
+        session,
+        name="runtime bind status preview",
+        limit=500,
+        dispatch_limit=10,
+        apply=False,
+    ).selected
+    repost_created_bindings = set(
+        session.scalars(
+            select(TaskJob.binding_id).where(
+                TaskJob.kind == TaskKind.REPOST,
+                TaskJob.binding_id.is_not(None),
+            )
+        ).all()
+    )
     succeeded_repost_bindings = set(
         session.scalars(
             select(TaskJob.binding_id).where(
@@ -178,16 +195,16 @@ def collect_operations_summary(
             )
         ).all()
     )
-    succeeded_claim_bindings = set(
+    claim_created_bindings = set(
         session.scalars(
             select(TaskJob.binding_id).where(
                 TaskJob.kind == TaskKind.CLAIM,
-                TaskJob.state == TaskState.SUCCEEDED,
                 TaskJob.binding_id.is_not(None),
             )
         ).all()
     )
-    claim_ready = len((bound_binding_ids & succeeded_repost_bindings) - succeeded_claim_bindings)
+    repost_ready = len(bound_binding_ids - repost_created_bindings)
+    claim_ready = len((bound_binding_ids & succeeded_repost_bindings) - claim_created_bindings)
     available_accounts = len(active_account_ids - occupied_account_ids)
     available_wallets = len(active_wallet_ids - occupied_wallet_ids)
     bind_ready = min(available_accounts, available_wallets)
@@ -213,23 +230,29 @@ def collect_operations_summary(
                 ready=resources.accounts_active,
                 waiting=waiting_tasks.get("verify_account", 0),
                 failed=failed_tasks.get("verify_account", 0),
+                retryable=failed_tasks.get("verify_account", 0),
                 detail="可对全部活跃 X 账号重新校验会话",
             ),
             OperationStageSummary(
                 key="bind",
                 label="绑定地址",
                 ready=bind_ready,
-                waiting=pending_bindings + waiting_tasks.get("bind", 0),
+                waiting=pending_bindings,
                 failed=failed_tasks.get("bind", 0),
-                detail="按未占用账号和未占用地址自动配对",
+                pollable=pollable_tasks.get("bind", 0),
+                retryable=failed_tasks.get("bind", 0),
+                status_syncable=bind_status_syncable,
+                detail="按未占用账号和未占用地址自动配对；pending 行从任务页观察或重试",
             ),
             OperationStageSummary(
                 key="repost",
                 label="转发推文",
-                ready=resources.bindings_bound,
+                ready=repost_ready,
                 waiting=waiting_tasks.get("repost", 0),
                 failed=failed_tasks.get("repost", 0),
-                detail="仅对已确认绑定的账号地址对创建任务",
+                pollable=pollable_tasks.get("repost", 0),
+                retryable=failed_tasks.get("repost", 0),
+                detail="仅对尚未创建转发任务的已绑定行创建任务",
             ),
             OperationStageSummary(
                 key="claim",
@@ -237,6 +260,8 @@ def collect_operations_summary(
                 ready=claim_ready,
                 waiting=waiting_tasks.get("claim", 0),
                 failed=failed_tasks.get("claim", 0),
+                pollable=pollable_tasks.get("claim", 0),
+                retryable=failed_tasks.get("claim", 0),
                 detail="转发校验成功后进入领取候选池",
             ),
         ],
@@ -248,3 +273,18 @@ def _task_counts_by_kind(session: Session, state: TaskState) -> dict[str, int]:
     return {kind.value: int(count) for kind, count in session.execute(
         select(TaskJob.kind, func.count()).where(TaskJob.state == state).group_by(TaskJob.kind)
     ).all()}
+
+
+def _pollable_task_counts_by_kind(session: Session) -> dict[str, int]:
+    """统计可安全重新入队轮询的等待任务，要求已有外部引用。"""
+    return {
+        kind.value: int(count)
+        for kind, count in session.execute(
+            select(TaskJob.kind, func.count())
+            .where(
+                TaskJob.state == TaskState.WAITING_EXTERNAL_VALIDATION,
+                TaskJob.external_operation_ref.is_not(None),
+            )
+            .group_by(TaskJob.kind)
+        ).all()
+    }

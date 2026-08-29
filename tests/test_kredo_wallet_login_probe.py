@@ -92,7 +92,7 @@ def test_task_state_reads_nested_twitter_quest_from_overview() -> None:
             "data": {
                 "twitterQuest": {
                     "status": "bound",
-                    "boundHandle": "MakylaGaylord",
+                    "boundHandle": "fixture-bound-handle",
                     "repostVerified": False,
                     "needsRebind": False,
                     "failReason": None,
@@ -104,7 +104,7 @@ def test_task_state_reads_nested_twitter_quest_from_overview() -> None:
 
     assert result == {
         "status": "bound",
-        "boundHandle": "MakylaGaylord",
+        "boundHandle": "fixture-bound-handle",
         "repostVerified": False,
         "needsRebind": False,
         "failReason": None,
@@ -133,7 +133,7 @@ def test_latest_task_state_prefers_latest_detail_or_overview_response() -> None:
                 "payload": {
                     "data": {
                         "status": "bound",
-                        "boundHandle": "MakylaGaylord",
+                        "boundHandle": "fixture-bound-handle",
                     }
                 },
             },
@@ -142,12 +142,70 @@ def test_latest_task_state_prefers_latest_detail_or_overview_response() -> None:
 
     assert result == {
         "status": "bound",
-        "boundHandle": "MakylaGaylord",
+        "boundHandle": "fixture-bound-handle",
         "repostVerified": None,
         "needsRebind": None,
         "failReason": None,
         "tweetUrl": None,
     }
+
+
+def test_fetch_task_state_from_api_uses_logged_in_page_context() -> None:
+    """状态判定可直接读取 Kredo 任务接口，而不依赖按钮显示。"""
+    mod = _load_module()
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        def evaluate(self, _script: str, url: str) -> dict[str, object]:
+            self.urls.append(url)
+            return {
+                "status": 200,
+                "payload": {
+                    "success": True,
+                    "data": {
+                        "status": "bound",
+                        "boundHandle": "fixture-bound-handle",
+                        "repostVerified": False,
+                        "needsRebind": False,
+                        "failReason": None,
+                        "tweetUrl": None,
+                    },
+                },
+            }
+
+    responses: list[dict[str, object]] = []
+    page = FakePage()
+
+    result = mod._fetch_task_state_from_api(page, responses)
+
+    assert result == {
+        "status": "bound",
+        "boundHandle": "fixture-bound-handle",
+        "repostVerified": False,
+        "needsRebind": False,
+        "failReason": None,
+        "tweetUrl": None,
+    }
+    assert page.urls == ["https://api.kredo.fun/api/v1/tasks/twitter"]
+    assert responses[0]["path"] == "/api/v1/tasks/twitter"
+
+
+def test_fetch_task_state_from_api_records_redacted_fetch_failures() -> None:
+    """接口读取失败只记录稳定错误码，不把异常细节写入结果。"""
+    mod = _load_module()
+
+    class FakePage:
+        def evaluate(self, _script: str, _url: str) -> dict[str, object]:
+            raise RuntimeError("secret-cookie-fixture")
+
+    responses: list[dict[str, object]] = []
+
+    assert mod._fetch_task_state_from_api(FakePage(), responses) is None
+    rendered = json.dumps(responses)
+    assert "browser_fetch_failed" in rendered
+    assert "secret-cookie-fixture" not in rendered
 
 
 def test_callback_result_reads_final_tasks_redirect() -> None:
@@ -173,6 +231,15 @@ def test_oauth_url_state_distinguishes_callback_tasks_and_error() -> None:
     )
     assert mod._oauth_url_state("https://x.com/i/oauth2/authorize?state=waiting") == "pending"
     assert mod._oauth_url_state("", popup_closed=True) == "popup_closed"
+
+
+def test_oauth_authorize_not_completed_is_a_distinct_completion_code() -> None:
+    """快速绑定可用该状态区分未离开授权页和 Kredo 慢回写。"""
+    mod = _load_module()
+
+    assert "authorize_not_completed" not in {
+        mod._oauth_url_state("https://x.com/i/oauth2/authorize?state=waiting")
+    }
 
 
 def test_latest_kredo_tasks_url_uses_last_matching_page() -> None:

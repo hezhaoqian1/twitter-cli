@@ -24,6 +24,9 @@ class FakeRedis:
 
     def brpoplpush(self, source: str, destination: str, timeout: int = 0) -> str | None:
         del timeout
+        return self.rpoplpush(source, destination)
+
+    def rpoplpush(self, source: str, destination: str) -> str | None:
         source_queue = self._list(source)
         if not source_queue:
             return None
@@ -74,6 +77,16 @@ def test_redis_queue_moves_to_processing_and_acknowledges_after_work() -> None:
 
     queue.acknowledge(message)
     assert list(client.lists["processing"]) == []
+
+
+def test_redis_queue_timeout_zero_is_non_blocking() -> None:
+    """bounded drain 使用 timeout=0 时不能永久阻塞 Redis。"""
+    client = FakeRedis()
+    queue = RedisTaskQueue(client, ready_key="ready", processing_key="processing")
+
+    assert queue.receive(timeout=0) is None
+    assert list(client.lists["ready"]) == []
+    assert list(client.lists.get("processing", [])) == []
 
 
 def test_redis_queue_requeues_uncompleted_message() -> None:

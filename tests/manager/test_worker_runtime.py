@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime, timezone
 from threading import Event
 
 from sqlalchemy import create_engine
@@ -154,5 +155,36 @@ def test_runner_forever_consumes_work_and_stops_cleanly() -> None:
         assert client.values["manager:workers:heartbeats"] == {}
         assert session.query(TaskJob).count() == 1
         assert session.query(TaskJob).one().state is TaskState.SUCCEEDED
+    finally:
+        session.close()
+
+
+def test_worker_acknowledges_stale_queue_message_without_requeue() -> None:
+    """Redis 旧消息与数据库状态不匹配时，以数据库状态为准清理消息。"""
+    session = _runner_session()
+    try:
+        _task(session)
+        job = session.query(TaskJob).one()
+        job.state = TaskState.FAILED
+        session.flush()
+        message = TaskMessage(
+            task_job_id=job.id,
+            owner_token="stale-owner",
+            lease_keys=tuple(job.lease_keys),
+            expires_at=datetime.now(timezone.utc),
+        )
+        queue = MemoryQueue()
+        queue.processing.append(message)
+
+        result = TaskWorker(session).run_message(
+            message,
+            queue,
+            lambda _: WorkerOutcome(state=TaskState.SUCCEEDED, summary="unused"),
+        )
+
+        assert result.id == job.id
+        assert result.state is TaskState.FAILED
+        assert not queue.ready
+        assert not queue.processing
     finally:
         session.close()

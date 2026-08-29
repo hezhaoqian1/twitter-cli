@@ -12,6 +12,10 @@ from sqlalchemy.orm import Session, joinedload
 from ...api.dependencies import get_db
 from ...models.tasks import TaskBatch, TaskJob
 from ...schemas.tasks import (
+    BindStatusSyncRequest,
+    BindStatusSyncResponse,
+    StageRetryRequest,
+    StageRetryResponse,
     TaskBatchCreateRequest,
     TaskBatchListResponse,
     TaskBatchResponse,
@@ -19,12 +23,20 @@ from ...schemas.tasks import (
     TaskEventResponse,
     TaskListResponse,
     TaskResponse,
+    StagePollRequeueRequest,
+    StagePollRequeueResponse,
+    PairedBindStageRequest,
+    PairedBindStageResponse,
     TaskTransitionRequest,
     WorkflowStageBatchCreateRequest,
-    WorkflowBatchCreateRequest,
 )
+from ...services.bind_status_sync import queue_bind_status_sync
+from ...services.paired_bindings import create_bound_pair_batch
+from ...services.stage_polls import requeue_stage_polls
+from ...services.stage_retries import retry_stage_failures
 from ...services.tasks import TaskBatchItem, TaskError, TaskService
-from ...services.workflows import WorkflowBatchItem, WorkflowService, WorkflowStageBatchItem
+from ...services.wallets import WalletInputError
+from ...services.workflows import WorkflowService, WorkflowStageBatchItem
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -151,38 +163,6 @@ def create_task_batch(
     return _batch_response(batch)
 
 
-@router.post("/workflows", response_model=TaskBatchResponse, status_code=201)
-def create_workflow_batch(
-    request: WorkflowBatchCreateRequest,
-    session: Session = Depends(get_db),
-) -> TaskBatchResponse:
-    """Create one ordered verify-bind-repost-claim chain per pair."""
-    try:
-        result = WorkflowService(session).create_batch(
-            name=request.name,
-            dispatch_limit=request.dispatch_limit,
-            items=[
-                WorkflowBatchItem(
-                    social_account_id=item.social_account_id,
-                    wallet_id=item.wallet_id,
-                    repost_target=item.repost_target,
-                    priority=item.priority,
-                )
-                for item in request.items
-            ],
-        )
-    except TaskError as exc:
-        _raise(exc)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    batch = session.execute(
-        select(TaskBatch)
-        .where(TaskBatch.id == result.batch.id)
-        .options(joinedload(TaskBatch.jobs).joinedload(TaskJob.events))
-    ).unique().scalar_one()
-    return _batch_response(batch)
-
-
 @router.post("/stages", response_model=TaskBatchResponse, status_code=201)
 def create_stage_batch(
     request: WorkflowStageBatchCreateRequest,
@@ -265,6 +245,115 @@ def cancel_task_batch(batch_id: UUID, session: Session = Depends(get_db)) -> Tas
         return _batch_response(TaskService(session).cancel_batch(batch_id))
     except TaskError as exc:
         _raise(exc)
+
+
+@router.post("/stage-polls", response_model=StagePollRequeueResponse)
+def requeue_stage_poll_tasks(
+    request: StagePollRequeueRequest,
+    session: Session = Depends(get_db),
+) -> StagePollRequeueResponse:
+    """Preview or requeue delayed stage status reads without replaying actions."""
+    try:
+        summary = requeue_stage_polls(
+            session,
+            stage=request.stage.value,
+            limit=request.limit,
+            apply=request.apply,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return StagePollRequeueResponse(
+        stage=request.stage,
+        selected=summary.selected,
+        requeued=summary.requeued,
+        skipped_missing_ref=summary.skipped_missing_ref,
+        apply=summary.apply,
+    )
+
+
+@router.post("/stage-retries", response_model=StageRetryResponse)
+def retry_stage_failed_tasks(
+    request: StageRetryRequest,
+    session: Session = Depends(get_db),
+) -> StageRetryResponse:
+    """Preview or retry failed tasks for one workflow stage."""
+    try:
+        summary = retry_stage_failures(
+            session,
+            stage=request.stage.value,
+            limit=request.limit,
+            apply=request.apply,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return StageRetryResponse(
+        stage=request.stage,
+        selected=summary.selected,
+        retried=summary.retried,
+        apply=summary.apply,
+    )
+
+
+@router.post("/bind-status-sync", response_model=BindStatusSyncResponse, status_code=201)
+def queue_bind_status_sync_tasks(
+    request: BindStatusSyncRequest,
+    session: Session = Depends(get_db),
+) -> BindStatusSyncResponse:
+    """Preview or queue read-only pending-binding status checks."""
+    try:
+        summary = queue_bind_status_sync(
+            session,
+            name=request.name,
+            limit=request.limit,
+            dispatch_limit=request.dispatch_limit,
+            apply=request.apply,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return BindStatusSyncResponse(
+        apply=summary.apply,
+        name=summary.name,
+        limit=summary.limit,
+        pending_bindings=summary.pending_bindings,
+        selected=summary.selected,
+        created_jobs=summary.created_jobs,
+        reused_jobs=summary.reused_jobs,
+        paused_action_jobs=summary.paused_action_jobs,
+        skipped_existing_status_job=summary.skipped_existing_status_job,
+        skipped_active_lease=summary.skipped_active_lease,
+        skipped_missing_secret=summary.skipped_missing_secret,
+    )
+
+
+@router.post("/paired-bind", response_model=PairedBindStageResponse, status_code=201)
+def create_paired_bind_stage(
+    request: PairedBindStageRequest,
+    session: Session = Depends(get_db),
+) -> PairedBindStageResponse:
+    """Preview or create a bind stage from exact account/private-key row pairs."""
+    try:
+        summary = create_bound_pair_batch(
+            session,
+            accounts_content=request.accounts_content.get_secret_value(),
+            private_keys_content=request.private_keys_content.get_secret_value(),
+            name=request.name,
+            limit=request.limit,
+            dispatch_limit=request.dispatch_limit,
+            include_unverified=request.include_unverified,
+            apply=request.apply,
+        )
+    except (ValueError, WalletInputError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return PairedBindStageResponse(
+        apply=summary.apply,
+        name=summary.name,
+        limit=summary.limit,
+        dispatch_limit=summary.dispatch_limit,
+        total_pairs=summary.total_pairs,
+        selected_pairs=summary.selected_pairs,
+        created_jobs=summary.created_jobs,
+        counts=summary.counts,
+    )
 
 
 @router.get("", response_model=TaskListResponse)

@@ -36,6 +36,7 @@ class TunnelTarget:
     port: int
     local_port: int
     name: str
+    idle_timeout_seconds: float = 300.0
 
 
 class ClashTunnelServer(socketserver.ThreadingTCPServer):
@@ -47,6 +48,7 @@ class ClashTunnelServer(socketserver.ThreadingTCPServer):
     def __init__(self, target: TunnelTarget, proxy: ProxyEndpoint) -> None:
         self.target = target
         self.proxy = proxy
+        self.idle_timeout_seconds = target.idle_timeout_seconds
         super().__init__(("127.0.0.1", target.local_port), ClashTunnelHandler)
 
 
@@ -65,7 +67,11 @@ class ClashTunnelHandler(socketserver.BaseRequestHandler):
             response_tail = self._open_connect(upstream)
             if response_tail:
                 self.request.sendall(response_tail)
-            self._relay(self.request, upstream)
+            self._relay(
+                self.request,
+                upstream,
+                idle_timeout_seconds=self.server.idle_timeout_seconds,
+            )
         except TimeoutError:
             # 长连接空闲超时后直接关闭，避免在日志里刷 traceback。
             return
@@ -100,11 +106,16 @@ class ClashTunnelHandler(socketserver.BaseRequestHandler):
         return tail
 
     @staticmethod
-    def _relay(client: socket.socket, upstream: socket.socket) -> None:
+    def _relay(
+        client: socket.socket,
+        upstream: socket.socket,
+        *,
+        idle_timeout_seconds: float,
+    ) -> None:
         """双向透传数据库协议，不解码也不记录业务内容。"""
         sockets = [client, upstream]
         while sockets:
-            readable, _, _ = select.select(sockets, [], [], 60)
+            readable, _, _ = select.select(sockets, [], [], idle_timeout_seconds)
             if not readable:
                 raise TimeoutError("Clash tunnel idle timeout")
             for source in readable:
@@ -133,7 +144,14 @@ def parse_proxy(value: str) -> ProxyEndpoint:
     )
 
 
-def parse_target(url: str, *, local_port: int, name: str, default_port: int) -> TunnelTarget:
+def parse_target(
+    url: str,
+    *,
+    local_port: int,
+    name: str,
+    default_port: int,
+    idle_timeout_seconds: float = 300.0,
+) -> TunnelTarget:
     """Extract the remote host and port from an existing manager connection URL."""
     parsed = urlsplit(url)
     if not parsed.hostname:
@@ -143,6 +161,7 @@ def parse_target(url: str, *, local_port: int, name: str, default_port: int) -> 
         port=parsed.port or default_port,
         local_port=local_port,
         name=name,
+        idle_timeout_seconds=idle_timeout_seconds,
     )
 
 
@@ -184,6 +203,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="temporary local Redis listener (default: 16379)",
     )
     parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=300.0,
+        help="seconds before an idle tunneled socket is closed (default: 300)",
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="command to run after --",
@@ -207,12 +232,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             local_port=args.postgres_port,
             name="PostgreSQL",
             default_port=5432,
+            idle_timeout_seconds=args.idle_timeout,
         ),
         parse_target(
             settings.redis_url,
             local_port=args.redis_port,
             name="Redis",
             default_port=6379,
+            idle_timeout_seconds=args.idle_timeout,
         ),
     )
     servers = [ClashTunnelServer(target, proxy) for target in targets]

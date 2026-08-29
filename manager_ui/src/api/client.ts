@@ -29,7 +29,25 @@ export type Binding = {
   bound_at: string | null;
   external_reference: string | null;
   archived_at: string | null;
+  stage?: {
+    repost_state: string | null;
+    claim_state: string | null;
+    can_repost: boolean;
+    can_claim: boolean;
+    repost_waiting: boolean;
+    claim_waiting: boolean;
+  };
   balance: Balance | null;
+};
+
+export type ManualWorkbenchResult = {
+  launched: number;
+  items: Array<{
+    binding_id: string;
+    process_id: number;
+    screenshot: string;
+    repost_target: string;
+  }>;
 };
 
 export type Balance = {
@@ -194,8 +212,78 @@ export type OperationsSummary = {
     ready: number;
     waiting: number;
     failed: number;
+    pollable: number;
+    retryable: number;
+    status_syncable: number;
     detail: string;
   }>;
+};
+
+export type NextStageRecommendation = {
+  action: "poll" | "retry" | "create_stage" | "wait" | string;
+  stage: "verify" | "bind" | "repost" | "claim" | null;
+  command: string;
+  reason: string;
+};
+
+export type AcceptanceAudit = {
+  resources: Record<string, number>;
+  stages: Array<{
+    stage: "verify" | "bind" | "repost" | "claim";
+    ready: number;
+    waiting: number;
+    failed: number;
+    pollable: number;
+    retryable: number;
+    status_syncable: number;
+  }>;
+  next_action: NextStageRecommendation;
+  actions: Array<{
+    action: string;
+    stage: "verify" | "bind" | "repost" | "claim";
+    count: number;
+    command: string;
+  }>;
+};
+
+export type StagePollRequeueResult = {
+  stage: "verify" | "bind" | "repost" | "claim";
+  selected: number;
+  requeued: number;
+  skipped_missing_ref: number;
+  apply: boolean;
+};
+
+export type StageRetryResult = {
+  stage: "verify" | "bind" | "repost" | "claim";
+  selected: number;
+  retried: number;
+  apply: boolean;
+};
+
+export type BindStatusSyncResult = {
+  apply: boolean;
+  name: string;
+  limit: number;
+  pending_bindings: number;
+  selected: number;
+  created_jobs: number;
+  reused_jobs: number;
+  paused_action_jobs: number;
+  skipped_existing_status_job: number;
+  skipped_active_lease: number;
+  skipped_missing_secret: number;
+};
+
+export type PairedBindResult = {
+  apply: boolean;
+  name: string;
+  limit: number;
+  dispatch_limit: number;
+  total_pairs: number;
+  selected_pairs: number;
+  created_jobs: number;
+  counts: Record<string, number>;
 };
 
 export type HealthReady = {
@@ -284,6 +372,8 @@ export const api = {
   healthReady: () => request<HealthReady>("/health/ready"),
   runtimeMetrics: () => request<RuntimeMetrics>("/api/runtime/metrics"),
   operationsSummary: () => request<OperationsSummary>("/api/runtime/operations-summary"),
+  nextStage: () => request<NextStageRecommendation>("/api/runtime/next-stage"),
+  acceptanceAudit: () => request<AcceptanceAudit>("/api/runtime/acceptance-audit"),
   vaultStatus: () => request<VaultStatus>("/api/vault/status"),
   initializeVault: (password: string) =>
     request<{ initialized: boolean; recovery_key: string }>("/api/vault/initialize", {
@@ -340,6 +430,22 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input)
     }),
+  previewPrivateKeyBatch: (input: {
+    content: string;
+    label_prefix: string;
+  }) =>
+    request<WalletPreview>("/api/wallet-sources/private-keys/preview", {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  commitPrivateKeyBatch: (input: {
+    content: string;
+    label_prefix: string;
+  }) =>
+    request<WalletPreview & { source_id: string | null }>("/api/wallet-sources/private-keys", {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
   commitWallet: (input: {
     source_type: "private_key" | "mnemonic";
     secret: string;
@@ -387,20 +493,6 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input)
     }),
-  createWorkflowBatch: (input: {
-    name: string;
-    dispatch_limit: number;
-    items: Array<{
-      social_account_id: string;
-      wallet_id: string;
-      repost_target: string;
-      priority?: number;
-    }>;
-  }) =>
-    request<TaskBatch>("/api/tasks/workflows", {
-      method: "POST",
-      body: JSON.stringify(input)
-    }),
   createStageBatch: (input: {
     name: string;
     stage: "verify" | "bind" | "repost" | "claim";
@@ -421,6 +513,68 @@ export const api = {
     request<Task>(`/api/tasks/${id}/${command}`, { method: "POST" }),
   batchCommand: (id: string, command: "pause" | "resume" | "cancel") =>
     request<TaskBatch>(`/api/tasks/batches/${id}/${command}`, { method: "POST" }),
+  requeueStagePolls: (input: {
+    stage: "bind" | "repost" | "claim";
+    limit: number;
+    apply: boolean;
+  }) =>
+    request<StagePollRequeueResult>("/api/tasks/stage-polls", {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  retryStageFailures: (input: {
+    stage: "verify" | "bind" | "repost" | "claim";
+    limit: number;
+    apply: boolean;
+  }) =>
+    request<StageRetryResult>("/api/tasks/stage-retries", {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  bindStatusSync: (input: {
+    name: string;
+    limit: number;
+    dispatch_limit: number;
+    apply: boolean;
+  }) =>
+    request<BindStatusSyncResult>("/api/tasks/bind-status-sync", {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  launchManualWorkbench: (input: {
+    binding_ids: string[];
+    repost_target: string;
+    limit: number;
+    timeout_seconds: number;
+  }) =>
+    request<ManualWorkbenchResult>("/api/bindings/manual-workbenches", {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  launchOneManualWorkbench: (
+    bindingId: string,
+    input: {
+      repost_target: string;
+      timeout_seconds: number;
+    }
+  ) =>
+    request<ManualWorkbenchResult>(`/api/bindings/${bindingId}/manual-workbench`, {
+      method: "POST",
+      body: JSON.stringify({ ...input, binding_ids: [], limit: 1 })
+    }),
+  pairedBind: (input: {
+    accounts_content: string;
+    private_keys_content: string;
+    name: string;
+    limit: number;
+    dispatch_limit: number;
+    include_unverified: boolean;
+    apply: boolean;
+  }) =>
+    request<PairedBindResult>("/api/tasks/paired-bind", {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
   syncBalances: (bindingIds?: string[]) =>
     request<{ task_ids: string[]; queued: number }>("/api/balances/sync", {
       method: "POST",
