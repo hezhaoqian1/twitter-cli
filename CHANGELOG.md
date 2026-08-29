@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.0.3 - 2026-08-29
+
+### Changed
+- The headed workbench now opens the X page for manual binding and reposting.
+- X is no longer reposted automatically or closed by the workbench.
+- The workbench API no longer requires or returns an automatic repost target.
+
 ## 0.9.0.2 - 2026-08-29
 
 ### Added
