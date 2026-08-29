@@ -224,3 +224,35 @@ is final diff review and shipping decisions.
   build (`1578 modules transformed`).
 - Through Clash `127.0.0.1:7890`, PostgreSQL returned `SELECT 1` and Redis
   returned `PING=True`; the probe wrote no application data.
+
+## Frontend Runtime Checkpoint
+
+- Started the Vite UI at `http://127.0.0.1:5178/` with the bundled Node
+  runtime.
+- Started the FastAPI service through the local Clash HTTP proxy using
+  `manager_clash_tunnel.py` and `uvicorn manager_api.main:create_app
+  --factory`.
+- `/health/ready` returned `postgres=ok` and `redis=ok`; `/api/tasks` returned
+  a valid empty page without writing application data.
+- Desktop browser validation passed for the Tasks page, search field, state
+  filter, batch filter, auto-refresh toggle, manual refresh action, and empty
+  state. No console errors were observed after the API was started.
+- Mobile browser validation passed at 390px wide with no horizontal overflow;
+  the task toolbar and filter panel stayed within the viewport.
+- Removed one duplicate mobile `.nav-link span` declaration found during the
+  responsive pass.
+
+## Stage Batch Checkpoint
+
+- Current product direction: operators create and observe four independent
+  stages instead of forcing every row through one login-bind-repost-claim
+  chain.
+- Implemented stage endpoint: `POST /api/tasks/stages`.
+- Implemented UI actions: `批量校验`, `批量绑定`, selected binding `批量转发`,
+  and selected binding `批量领取`.
+- Confirmed invariants: stage children have no `depends_on_task_id`; bind
+  creates pending pair records and then a bind job; repost requires an already
+  confirmed binding and keeps delayed provider validation in
+  `waiting_external_validation`; claim remains a separate operator decision.
+- Verification: `343 passed, 6 deselected, 1 warning`; Ruff passed; bundled TypeScript and
+  Vite production build passed; synthetic four-stage runner acceptance passed.

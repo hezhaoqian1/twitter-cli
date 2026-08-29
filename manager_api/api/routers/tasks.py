@@ -20,10 +20,11 @@ from ...schemas.tasks import (
     TaskListResponse,
     TaskResponse,
     TaskTransitionRequest,
+    WorkflowStageBatchCreateRequest,
     WorkflowBatchCreateRequest,
 )
 from ...services.tasks import TaskBatchItem, TaskError, TaskService
-from ...services.workflows import WorkflowBatchItem, WorkflowService
+from ...services.workflows import WorkflowBatchItem, WorkflowService, WorkflowStageBatchItem
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -46,6 +47,8 @@ def _response(job: TaskJob) -> TaskResponse:
         started_at=job.started_at,
         finished_at=job.finished_at,
         external_operation_ref=job.external_operation_ref,
+        # 只返回是否存在目标，避免把原始 URL 或任务参数带回前端。
+        target_configured=bool(job.external_target.strip()),
         result_summary=job.result_summary,
         failure_code=job.failure_code,
         poll_deadline_at=job.poll_deadline_at,
@@ -163,6 +166,40 @@ def create_workflow_batch(
                     social_account_id=item.social_account_id,
                     wallet_id=item.wallet_id,
                     repost_target=item.repost_target,
+                    priority=item.priority,
+                )
+                for item in request.items
+            ],
+        )
+    except TaskError as exc:
+        _raise(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    batch = session.execute(
+        select(TaskBatch)
+        .where(TaskBatch.id == result.batch.id)
+        .options(joinedload(TaskBatch.jobs).joinedload(TaskJob.events))
+    ).unique().scalar_one()
+    return _batch_response(batch)
+
+
+@router.post("/stages", response_model=TaskBatchResponse, status_code=201)
+def create_stage_batch(
+    request: WorkflowStageBatchCreateRequest,
+    session: Session = Depends(get_db),
+) -> TaskBatchResponse:
+    """Create one homogeneous workflow stage batch."""
+    try:
+        result = WorkflowService(session).create_stage_batch(
+            name=request.name,
+            stage=request.stage.value,
+            dispatch_limit=request.dispatch_limit,
+            items=[
+                WorkflowStageBatchItem(
+                    social_account_id=item.social_account_id,
+                    wallet_id=item.wallet_id,
+                    binding_id=item.binding_id,
+                    external_target=item.external_target,
                     priority=item.priority,
                 )
                 for item in request.items

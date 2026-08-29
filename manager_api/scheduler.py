@@ -53,7 +53,9 @@ class Scheduler:
         if requested_limit < 1:
             return []
         current_time = now or utc_now()
-        TaskService(self.session).refresh_dependency_states()
+        task_service = TaskService(self.session)
+        task_service.requeue_due_polls(now=current_time)
+        task_service.refresh_dependency_states()
         active_leases = self.session.scalar(
             select(func.count(func.distinct(ResourceLease.task_job_id))).where(
                 ResourceLease.expires_at > current_time

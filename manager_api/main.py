@@ -8,6 +8,8 @@ from typing import Any
 from fastapi import FastAPI
 from sqlalchemy import create_engine, text
 
+# 显式加载全部持久化模型，确保应用运行时的 Base.metadata 包含完整表集。
+from . import models as _models  # noqa: F401
 from .api.routers.accounts import router as accounts_router
 from .api.routers.bindings import router as bindings_router
 from .api.routers.balances import router as balances_router
@@ -63,7 +65,7 @@ def create_app(
     check_postgres = postgres_probe or (lambda: _postgres_probe(runtime))
     check_redis = redis_probe or (lambda: _redis_probe(runtime))
 
-    app = FastAPI(title="Account Wallet Task Manager", version="0.9.0.1")
+    app = FastAPI(title="Account Wallet Task Manager", version="0.9.0.2")
     app.state.settings = runtime
     app.state.vault_runtime = VaultRuntime(
         cache_ttl_seconds=runtime.vault_cache_ttl_seconds,

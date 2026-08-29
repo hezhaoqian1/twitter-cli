@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.9.0.2 - 2026-08-29
+
+### Added
+- Split the operations console into independent verify, bind, repost, and claim stage batches.
+- Added a stage summary view so operators can see readiness, waiting work, and failures per stage.
+- Added separate batch actions for stage-oriented workflow runs.
+
+### Changed
+- The manager now requeues due external polls before scheduling, so delayed repost checks resume automatically.
+- The API and UI now show redacted target state instead of raw task targets.
+- The local API runs through the Clash tunnel with the `create_app()` factory entry point.
+
+### Fixed
+- Repost polling no longer repeats the repost action while waiting for Kredo validation.
+- The Clash tunnel now closes idle connections quietly instead of printing timeout tracebacks.
+- The operations overview now reflects the current `8000` backend and `5178` UI runtime.
+
 ## 0.9.0.1 - 2026-08-28
 
 - Add read-only runtime metrics for Redis queues, task states, resource leases,

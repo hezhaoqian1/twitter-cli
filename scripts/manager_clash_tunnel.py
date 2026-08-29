@@ -66,6 +66,9 @@ class ClashTunnelHandler(socketserver.BaseRequestHandler):
             if response_tail:
                 self.request.sendall(response_tail)
             self._relay(self.request, upstream)
+        except TimeoutError:
+            # 长连接空闲超时后直接关闭，避免在日志里刷 traceback。
+            return
         finally:
             upstream.close()
 

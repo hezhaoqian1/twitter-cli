@@ -62,7 +62,12 @@ class KredoTaskAdapter(Protocol):
     ) -> ExternalOperation:
         """领取当前账号地址配对对应的奖励。"""
 
-    def status(self, operation: OperationMaterial):
+    def status(
+        self,
+        operation: OperationMaterial,
+        account: AccountMaterial | None = None,
+        wallet: WalletMaterial | None = None,
+    ):
         """读取外部任务的最终状态。"""
 
     def account_summary(
@@ -195,7 +200,7 @@ class TaskExecutionService:
         """先执行 X 转发，再读取 Kredo 延迟校验状态，避免重复提交。"""
         if job.external_operation_ref:
             # 轮询任务已经有外部引用，只做只读状态检查，不再次触发转发。
-            kredo_result = self.kredo_adapter.status(operation)
+            kredo_result = self.kredo_adapter.status(operation, account, wallet)
             return self._operation_outcome(kredo_result)
 
         x_result = self.x_adapter.repost(account, operation)
@@ -203,7 +208,7 @@ class TaskExecutionService:
             return self._operation_outcome(x_result)
 
         # Kredo 的状态传播可能慢于 X 接口；只读状态用于决定是否继续轮询。
-        kredo_result = self.kredo_adapter.status(operation)
+        kredo_result = self.kredo_adapter.status(operation, account, wallet)
         if kredo_result.status.is_complete:
             return self._operation_outcome(kredo_result)
         return self._operation_outcome(kredo_result)

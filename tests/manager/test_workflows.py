@@ -21,7 +21,12 @@ from manager_api.services.execution import TaskExecutionService
 from manager_api.services.imports import AccountImportService
 from manager_api.services.vault import VaultService
 from manager_api.services.wallets import WalletService, WalletSourceType
-from manager_api.services.workflows import WorkflowBatchItem, WorkflowService
+from manager_api.services.workflows import (
+    WorkflowBatchItem,
+    WorkflowService,
+    WorkflowStage,
+    WorkflowStageBatchItem,
+)
 from manager_api.worker import TaskWorker, WorkerOutcome
 
 
@@ -86,7 +91,8 @@ class SyntheticWorkflowKredoAdapter:
             evidence=AdapterEvidence("bound", "synthetic binding complete"),
         )
 
-    def status(self, operation):
+    def status(self, operation, account=None, wallet=None):
+        del account, wallet
         self.status_calls += 1
         return ExternalObservation(
             operation_ref=f"synthetic-status-{self.status_calls}",
@@ -215,6 +221,121 @@ def test_workflow_dispatches_in_stages_and_keeps_pairs_independent() -> None:
         assert chains[0][3].state is TaskState.QUEUED
         assert chains[1][1].state is TaskState.BLOCKED
         assert chains[2][1].state is TaskState.QUEUED
+
+
+def test_stage_batches_are_homogeneous_and_never_add_cross_stage_dependencies() -> None:
+    """Each operator stage stays independently schedulable and observable."""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        pairs = [_pair(session, index) for index in range(11, 14)]
+        service = WorkflowService(session)
+
+        verify = service.create_stage_batch(
+            name="Verify three accounts",
+            stage=WorkflowStage.VERIFY,
+            dispatch_limit=2,
+            items=[
+                WorkflowStageBatchItem(social_account_id=account.id, external_target="x:verify")
+                for account, _ in pairs
+            ],
+        )
+        assert verify.batch.workflow_type == "stage:verify"
+        assert {job.kind for job in verify.jobs} == {TaskKind.VERIFY_ACCOUNT}
+        assert all(job.depends_on_task_id is None for job in verify.jobs)
+
+        bind = service.create_stage_batch(
+            name="Bind three pairs",
+            stage=WorkflowStage.BIND,
+            dispatch_limit=2,
+            items=[
+                WorkflowStageBatchItem(
+                    social_account_id=account.id,
+                    wallet_id=wallet.id,
+                    external_target="kredo:bind",
+                )
+                for account, wallet in pairs
+            ],
+        )
+        assert bind.batch.workflow_type == "stage:bind"
+        assert {job.kind for job in bind.jobs} == {TaskKind.BIND}
+        assert all(job.depends_on_task_id is None for job in bind.jobs)
+        assert all(job.binding_id is not None for job in bind.jobs)
+
+        for job in bind.jobs:
+            assert job.binding_id is not None
+            BindingService(session).confirm(job.binding_id, f"fixture:{job.binding_id}")
+
+        repost = service.create_stage_batch(
+            name="Repost verified pairs",
+            stage=WorkflowStage.REPOST,
+            dispatch_limit=2,
+            items=[
+                WorkflowStageBatchItem(
+                    binding_id=job.binding_id,
+                    external_target=f"tweet-{index}",
+                )
+                for index, job in enumerate(bind.jobs, start=1)
+            ],
+        )
+        claim = service.create_stage_batch(
+            name="Claim verified pairs",
+            stage=WorkflowStage.CLAIM,
+            dispatch_limit=2,
+            items=[
+                WorkflowStageBatchItem(binding_id=job.binding_id, external_target="kredo:claim")
+                for job in bind.jobs
+            ],
+        )
+
+        assert repost.batch.workflow_type == "stage:repost"
+        assert claim.batch.workflow_type == "stage:claim"
+        assert all(job.depends_on_task_id is None for job in (*repost.jobs, *claim.jobs))
+        assert all(job.state is TaskState.QUEUED for job in (*verify.jobs, *bind.jobs, *repost.jobs, *claim.jobs))
+
+
+def test_failed_or_waiting_stage_jobs_do_not_block_independent_batches() -> None:
+    """A delayed provider response only holds its own resources and batch slot."""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        accounts = [_pair(session, index)[0] for index in range(21, 24)]
+        service = WorkflowService(session)
+        first = service.create_stage_batch(
+            name="First verification stage",
+            stage=WorkflowStage.VERIFY,
+            dispatch_limit=1,
+            items=[WorkflowStageBatchItem(social_account_id=account.id) for account in accounts[:2]],
+        )
+        second = service.create_stage_batch(
+            name="Second verification stage",
+            stage=WorkflowStage.VERIFY,
+            dispatch_limit=1,
+            items=[WorkflowStageBatchItem(social_account_id=accounts[2].id)],
+        )
+        scheduler = Scheduler(
+            session,
+            worker_concurrency=2,
+            browser_concurrency=2,
+            lease_ttl_seconds=60,
+        )
+        worker = TaskWorker(session, scheduler=scheduler)
+
+        grants = scheduler.dispatch_once(limit=2)
+        assert {grant.task_job_id for grant in grants} == {first.jobs[0].id, second.jobs[0].id}
+        for grant in grants:
+            worker.run_one(
+                grant,
+                lambda job: WorkerOutcome(
+                    state=TaskState.FAILED if job.id == first.jobs[0].id else TaskState.SUCCEEDED,
+                    summary="synthetic stage outcome",
+                    failure_code="synthetic_invalid" if job.id == first.jobs[0].id else None,
+                ),
+            )
+
+        next_grant = scheduler.dispatch_once(limit=1)
+        assert [grant.task_job_id for grant in next_grant] == [first.jobs[1].id]
+        assert second.jobs[0].state is TaskState.SUCCEEDED
 
 
 def _complete_bind(session: Session, job) -> WorkerOutcome:

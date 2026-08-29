@@ -18,6 +18,7 @@ import {
   Plus,
   RefreshCw,
   RotateCcw,
+  Search,
   Send,
   ShieldCheck,
   Upload,
@@ -30,6 +31,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState
 } from "react";
 
@@ -38,7 +40,9 @@ import {
   AccountImportResult,
   api,
   ApiError,
+  Balance,
   RuntimeMetrics,
+  OperationsSummary,
   Task,
   TaskBatch,
   VaultBackupSummary,
@@ -59,26 +63,118 @@ const pageMeta: Array<{ key: PageKey; label: string; icon: typeof Activity }> = 
   { key: "vault", label: "Vault", icon: LockKeyhole }
 ];
 
-function useResource<T>(load: () => Promise<T>, dependency: number) {
-  const [value, setValue] = useState<T | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+const RESOURCE_CACHE_TTL_MS = 30_000;
 
-  const reload = useCallback(async () => {
-    setLoading(true);
-    try {
-      setValue(await load());
-      setError(null);
-    } catch (caught) {
-      setError(toMessage(caught));
-    } finally {
-      setLoading(false);
-    }
-  }, [load]);
+type ResourceCacheEntry<T> = {
+  value: T | null;
+  error: string | null;
+  promise: Promise<T> | null;
+  updatedAt: number;
+  dependency: number | null;
+};
+
+const resourceCache = new Map<string, ResourceCacheEntry<unknown>>();
+
+function resourceEntry<T>(key: string): ResourceCacheEntry<T> {
+  const cached = resourceCache.get(key) as ResourceCacheEntry<T> | undefined;
+  if (cached) return cached;
+  const created: ResourceCacheEntry<T> = {
+    value: null,
+    error: null,
+    promise: null,
+    updatedAt: 0,
+    dependency: null
+  };
+  resourceCache.set(key, created as ResourceCacheEntry<unknown>);
+  return created;
+}
+
+function useResource<T>(
+  key: string,
+  load: () => Promise<T>,
+  dependency: number,
+  options: { ttlMs?: number; keepPrevious?: boolean } = {}
+) {
+  const entry = resourceEntry<T>(key);
+  const ttlMs = options.ttlMs ?? RESOURCE_CACHE_TTL_MS;
+  const keepPrevious = options.keepPrevious ?? true;
+  const [value, setValue] = useState<T | null>(() => entry.value);
+  const [error, setError] = useState<string | null>(() => entry.error);
+  const [loading, setLoading] = useState(() => entry.value === null);
+  const mounted = useRef(true);
 
   useEffect(() => {
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  const syncFromEntry = useCallback((next: ResourceCacheEntry<T>) => {
+    if (!mounted.current) return;
+    setValue(next.value);
+    setError(next.error);
+    setLoading(false);
+  }, []);
+
+  const reload = useCallback(
+    async (force = false) => {
+      const current = resourceEntry<T>(key);
+      const now = Date.now();
+      const dependencyChanged = current.dependency !== dependency;
+      const cacheFresh = current.value !== null && now - current.updatedAt < ttlMs;
+
+      // 同一个刷新版本内切换页面时直接复用缓存；慢接口在后台更新时不清空旧数据。
+      if (!force && !dependencyChanged && cacheFresh) {
+        syncFromEntry(current);
+        return current.value;
+      }
+
+      if (current.promise) {
+        setLoading(!keepPrevious || current.value === null);
+        try {
+          const result = await current.promise;
+          syncFromEntry(current);
+          return result;
+        } catch {
+          syncFromEntry(current);
+          return current.value;
+        }
+      }
+
+      setLoading(!keepPrevious || current.value === null);
+      current.dependency = dependency;
+      current.promise = load()
+        .then((result) => {
+          current.value = result;
+          current.error = null;
+          current.updatedAt = Date.now();
+          return result;
+        })
+        .catch((caught) => {
+          current.error = toMessage(caught);
+          current.updatedAt = Date.now();
+          throw caught;
+        })
+        .finally(() => {
+          current.promise = null;
+        });
+
+      try {
+        const result = await current.promise;
+        syncFromEntry(current);
+        return result;
+      } catch {
+        syncFromEntry(current);
+        return current.value;
+      }
+    },
+    [dependency, keepPrevious, key, load, syncFromEntry, ttlMs]
+  );
+
+  useEffect(() => {
+    mounted.current = true;
     void reload();
-  }, [dependency, reload]);
+  }, [reload]);
 
   return { value, error, loading, reload };
 }
@@ -118,8 +214,78 @@ function stateTone(state: string) {
   return "neutral";
 }
 
+const stateLabels: Record<string, string> = {
+  active: "可用",
+  archived: "已归档",
+  bound: "已绑定",
+  cancelled: "已取消",
+  failed: "失败",
+  healthy: "健康",
+  invalid: "无效",
+  leased: "已租约",
+  paused: "已暂停",
+  pending: "待确认",
+  queued: "排队中",
+  running: "执行中",
+  succeeded: "已完成",
+  valid: "有效",
+  waiting_external_validation: "等待外部校验"
+};
+
+const kindLabels: Record<string, string> = {
+  balance_sync: "余额同步",
+  bind: "绑定地址",
+  claim: "领取奖励",
+  repost: "转发推文",
+  verify_account: "校验会话"
+};
+
+function stateLabel(value: string) {
+  return stateLabels[value] ?? value.replaceAll("_", " ");
+}
+
+function kindLabel(value: string) {
+  return kindLabels[value] ?? value.replaceAll("_", " ");
+}
+
+function workflowLabel(value: string) {
+  if (value.startsWith("stage:")) {
+    const stage = value.slice("stage:".length);
+    return {
+      verify: "会话校验批次",
+      bind: "绑定批次",
+      repost: "转发批次",
+      claim: "领取批次"
+    }[stage] ?? `${stage} 批次`;
+  }
+  if (value === "account_wallet") {
+    return "账号-地址工作流";
+  }
+  return kindLabel(value);
+}
+
 function StateChip({ value }: { value: string }) {
-  return <span className={`chip chip-${stateTone(value)}`}>{value.replaceAll("_", " ")}</span>;
+  return <span className={`chip chip-${stateTone(value)}`}>{stateLabel(value)}</span>;
+}
+
+function healthCheckLabel(value: string) {
+  return {
+    postgres: "PostgreSQL",
+    redis: "Redis"
+  }[value] ?? value;
+}
+
+function HealthChecks({ checks }: { checks: Record<string, "ok" | "down"> }) {
+  return (
+    <div className="health-checks" aria-label="依赖健康状态">
+      {Object.entries(checks).map(([name, state]) => (
+        <span className={`health-check health-${state}`} key={name} title={`${healthCheckLabel(name)}：${state === "ok" ? "正常" : "不可用"}`}>
+          <span />
+          {healthCheckLabel(name)}
+        </span>
+      ))}
+    </div>
+  );
 }
 
 function IconButton({
@@ -154,16 +320,18 @@ function Button({
   onClick,
   disabled = false,
   type = "button",
-  tone = "secondary"
+  tone = "secondary",
+  title
 }: {
   children: ReactNode;
   onClick?: () => void;
   disabled?: boolean;
   type?: "button" | "submit";
   tone?: "primary" | "secondary" | "danger";
+  title?: string;
 }) {
   return (
-    <button className={`button button-${tone}`} type={type} onClick={onClick} disabled={disabled}>
+    <button className={`button button-${tone}`} type={type} onClick={onClick} disabled={disabled} title={title}>
       {children}
     </button>
   );
@@ -224,6 +392,24 @@ function Dialog({
   onClose: () => void;
   wide?: boolean;
 }) {
+  const dialogRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    const previousFocus = document.activeElement as HTMLElement | null;
+    dialogRef.current?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      previousFocus?.focus?.();
+    };
+  }, [onClose]);
+
   return (
     <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
       <section
@@ -231,6 +417,8 @@ function Dialog({
         role="dialog"
         aria-modal="true"
         aria-label={title}
+        tabIndex={-1}
+        ref={dialogRef}
         onMouseDown={(event) => event.stopPropagation()}
       >
         <div className="dialog-heading">
@@ -255,13 +443,42 @@ function copyText(value: string, notify: (message: string) => void) {
 export function App() {
   const [page, setPage] = useState<PageKey>("overview");
   const [refresh, setRefresh] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastRefreshAt, setLastRefreshAt] = useState<number | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
-  const vault = useResource(api.vaultStatus, refresh);
+  const noticeTimer = useRef<number | null>(null);
+  const vault = useResource("vault-status", api.vaultStatus, refresh);
+  const health = useResource("health-ready", api.healthReady, refresh);
 
   const notify = useCallback((message: string, tone: NoticeTone = "success") => {
+    if (noticeTimer.current) {
+      window.clearTimeout(noticeTimer.current);
+    }
     setNotice({ message, tone });
-    window.setTimeout(() => setNotice(null), 4200);
+    noticeTimer.current = window.setTimeout(() => {
+      setNotice(null);
+      noticeTimer.current = null;
+    }, 4200);
   }, []);
+
+  useEffect(() => () => {
+    if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+  }, []);
+
+  useEffect(() => {
+    if (refresh === 0) return;
+    setRefreshing(true);
+    const timer = window.setTimeout(() => {
+      setRefreshing(false);
+      setLastRefreshAt(Date.now());
+    }, 850);
+    return () => window.clearTimeout(timer);
+  }, [refresh]);
+
+  const refreshAll = () => {
+    setRefreshing(true);
+    setRefresh((value) => value + 1);
+  };
 
   const complete = useCallback(
     (message: string) => {
@@ -311,12 +528,16 @@ export function App() {
             <h1>{pageMeta.find((item) => item.key === page)?.label}</h1>
           </div>
           <div className="topbar-actions">
-            <span className={`connection ${vault.error ? "is-down" : ""}`}>
+            <span className={`connection ${health.error ? "is-down" : ""}`}>
               <span />
-              {vault.error ? "API 未连接" : "API 在线"}
+              {health.error ? "API 未连接" : "API 在线"}
             </span>
-            <IconButton label="刷新当前数据" onClick={() => setRefresh((value) => value + 1)}>
-              <RefreshCw size={18} />
+            {health.value && <HealthChecks checks={health.value.checks} />}
+            <span className="refresh-state">
+              {refreshing ? "刷新中…" : lastRefreshAt ? `更新于 ${dateTime(new Date(lastRefreshAt).toISOString())}` : "等待刷新"}
+            </span>
+            <IconButton label="刷新当前数据" onClick={refreshAll} disabled={refreshing} tone={refreshing ? "primary" : "neutral"}>
+              <RefreshCw size={18} className={refreshing ? "spin" : ""} />
             </IconButton>
           </div>
         </header>
@@ -364,11 +585,13 @@ export function App() {
 }
 
 function Overview({ refresh, onNavigate }: { refresh: number; onNavigate: (page: PageKey) => void }) {
-  const accounts = useResource(api.accounts, refresh);
-  const wallets = useResource(api.wallets, refresh);
-  const bindings = useResource(api.bindings, refresh);
-  const tasks = useResource(api.tasks, refresh);
-  const runtime = useResource(api.runtimeMetrics, refresh);
+  const accounts = useResource("accounts", api.accounts, refresh);
+  const wallets = useResource("wallets", api.wallets, refresh);
+  const bindings = useResource("bindings", api.bindings, refresh);
+  const balances = useResource("balances", api.balances, refresh);
+  const tasks = useResource("tasks", api.tasks, refresh);
+  const runtime = useResource("runtime-metrics", api.runtimeMetrics, refresh);
+  const operations = useResource("operations-summary", api.operationsSummary, refresh);
   const summary = useMemo(() => {
     const taskItems = tasks.value?.items ?? [];
     return {
@@ -377,18 +600,87 @@ function Overview({ refresh, onNavigate }: { refresh: number; onNavigate: (page:
       bound: bindings.value?.items.filter((item) => item.state === "bound").length ?? 0,
       activeTasks: taskItems.filter((item) =>
         ["queued", "leased", "running", "waiting_external_validation"].includes(item.state)
-      ).length
+      ).length,
+      points: sumBalance(balances.value?.items ?? [], "points"),
+      hsk: sumBalance(balances.value?.items ?? [], "total_hsk")
     };
-  }, [accounts.value, bindings.value, tasks.value, wallets.value]);
+  }, [accounts.value, balances.value, bindings.value, tasks.value, wallets.value]);
 
   return (
     <div className="page-stack">
-      <div className="metric-grid">
-        <Metric label="账号" value={summary.accounts} icon={<KeyRound size={19} />} onClick={() => onNavigate("accounts")} />
-        <Metric label="地址" value={summary.wallets} icon={<WalletCards size={19} />} onClick={() => onNavigate("wallets")} />
-        <Metric label="已绑定" value={summary.bound} icon={<Link2 size={19} />} onClick={() => onNavigate("bindings")} />
-        <Metric label="运行中任务" value={summary.activeTasks} icon={<Activity size={19} />} onClick={() => onNavigate("tasks")} />
+      <div className="hero-grid">
+        <Panel className="hero-panel">
+          <div className="hero-panel-copy">
+            <span className="eyebrow">OPERATIONS CENTER</span>
+            <h2>分阶段批量控制台</h2>
+            <p>账号校验、地址绑定、推文转发和领取奖励分离成独立批次。你可以单点跑，也可以批量跑，并随时看见哪一步在等待外部回写。</p>
+          </div>
+          <div className="hero-panel-actions">
+            <Button tone="primary" onClick={() => onNavigate("accounts")}>
+              <KeyRound size={16} />
+              去校验
+            </Button>
+            <Button onClick={() => onNavigate("bindings")}>
+              <Link2 size={16} />
+              去绑定
+            </Button>
+            <Button onClick={() => onNavigate("tasks")}>
+              <Layers3 size={16} />
+              看任务流
+            </Button>
+          </div>
+        </Panel>
+        <div className="metric-grid">
+          <Metric label="账号" value={summary.accounts} icon={<KeyRound size={19} />} onClick={() => onNavigate("accounts")} />
+          <Metric label="地址" value={summary.wallets} icon={<WalletCards size={19} />} onClick={() => onNavigate("wallets")} />
+          <Metric label="已绑定" value={summary.bound} icon={<Link2 size={19} />} onClick={() => onNavigate("bindings")} />
+          <Metric label="未完成任务" value={summary.activeTasks} icon={<Activity size={19} />} onClick={() => onNavigate("tasks")} />
+        </div>
       </div>
+      <Panel
+        title="阶段控制台"
+        action={<span className="subtle-label">{operations.value ? dateTime(operations.value.generated_at) : "等待摘要"}</span>}
+      >
+        {operations.loading ? (
+          <LoadingRows />
+        ) : operations.error ? (
+          <EmptyState title="阶段摘要暂不可用" detail={operations.error} />
+        ) : operations.value ? (
+          <>
+            <div className="stage-grid">
+              {operations.value.stages.map((stage) => (
+                <StageCard key={stage.key} stage={stage} onNavigate={onNavigate} />
+              ))}
+            </div>
+            <div className="resource-band">
+              <ResourceCard label="账号池" primary={`${operations.value.resources.accounts_available_for_binding}`} detail={`${operations.value.resources.accounts_active} active · ${operations.value.resources.accounts_healthy} healthy`} />
+              <ResourceCard label="地址池" primary={`${operations.value.resources.wallets_available_for_binding}`} detail={`${operations.value.resources.wallets_active} active · ${operations.value.resources.wallets_total} total`} />
+              <ResourceCard label="绑定池" primary={`${operations.value.resources.bindings_bound}`} detail={`${operations.value.resources.bindings_pending} pending · ${operations.value.resources.bindings_total} total`} />
+            </div>
+          </>
+        ) : null}
+      </Panel>
+      <Panel
+        title="资产概览"
+        action={
+          <button type="button" className="text-link" onClick={() => onNavigate("bindings")}>
+            查看绑定
+            <ArrowRight size={14} />
+          </button>
+        }
+      >
+        {balances.loading ? (
+          <LoadingRows />
+        ) : balances.error ? (
+          <EmptyState title="资产数据暂不可用" detail={balances.error} />
+        ) : (
+          <div className="balance-summary">
+            <BalanceStat label="Points" value={summary.points} detail={`${balances.value?.total ?? 0} 个绑定记录`} />
+            <BalanceStat label="HSK 总量" value={summary.hsk} detail="现金余额 + 持仓估值" />
+            <BalanceStat label="最近同步" value={latestBalanceTime(balances.value?.items ?? [])} detail="仅显示最新缓存" />
+          </div>
+        )}
+      </Panel>
       <div className="overview-grid">
         <Panel title="近期任务" action={<span className="subtle-label">{tasks.value?.total ?? 0} total</span>}>
           {tasks.loading ? (
@@ -399,7 +691,7 @@ function Overview({ refresh, onNavigate }: { refresh: number; onNavigate: (page:
                 <button key={task.id} type="button" className="timeline-row" onClick={() => onNavigate("tasks")}>
                   <span className={`timeline-dot tone-${stateTone(task.state)}`} />
                   <span>
-                    <strong>{task.kind}</strong>
+                    <strong>{kindLabel(task.kind)}</strong>
                     <small>{task.result_summary || "任务已入队"}</small>
                   </span>
                   <StateChip value={task.state} />
@@ -421,17 +713,65 @@ function Overview({ refresh, onNavigate }: { refresh: number; onNavigate: (page:
           </div>
         </Panel>
       </div>
-      <RuntimePanel runtime={runtime.value} loading={runtime.loading} error={runtime.error} />
+      <RuntimePanel
+        runtime={runtime.value}
+        activeTasks={summary.activeTasks}
+        loading={runtime.loading}
+        error={runtime.error}
+      />
+    </div>
+  );
+}
+
+function StageCard({
+  stage,
+  onNavigate
+}: {
+  stage: OperationsSummary["stages"][number];
+  onNavigate: (page: PageKey) => void;
+}) {
+  const icon = {
+    verify: <ShieldCheck size={18} />,
+    bind: <Link2 size={18} />,
+    repost: <Send size={18} />,
+    claim: <Play size={18} />
+  }[stage.key];
+  const targetPage = stage.key === "verify" || stage.key === "bind" ? "accounts" : "bindings";
+  return (
+    <button type="button" className="stage-card" onClick={() => onNavigate(targetPage)}>
+      <div className="stage-card-top">
+        <span className="stage-icon">{icon}</span>
+        <span className="stage-key">{stage.label}</span>
+      </div>
+      <strong>{stage.ready}</strong>
+      <span className="stage-detail">{stage.detail}</span>
+      <div className="stage-meta">
+        <span>{stage.waiting} 待回写</span>
+        <span>{stage.failed} 失败</span>
+        <ArrowRight size={15} />
+      </div>
+    </button>
+  );
+}
+
+function ResourceCard({ label, primary, detail }: { label: string; primary: string; detail: string }) {
+  return (
+    <div className="resource-card">
+      <span>{label}</span>
+      <strong>{primary}</strong>
+      <small>{detail}</small>
     </div>
   );
 }
 
 function RuntimePanel({
   runtime,
+  activeTasks,
   loading,
   error
 }: {
   runtime: RuntimeMetrics | null;
+  activeTasks: number;
   loading: boolean;
   error: string | null;
 }) {
@@ -442,14 +782,25 @@ function RuntimePanel({
       ) : error ? (
         <EmptyState title="运行态暂不可用" detail={error} />
       ) : runtime ? (
-        <div className="runtime-grid">
-          <StatusLine label="待处理队列" value={`${runtime.queues.ready}`} tone={runtime.queues.ready ? "warning" : "success"} />
-          <StatusLine label="处理中队列" value={`${runtime.queues.processing}`} tone={runtime.queues.processing ? "warning" : "neutral"} />
-          <StatusLine label="活跃租约" value={`${runtime.leases.active}`} tone={runtime.leases.active ? "warning" : "success"} />
-          <StatusLine label="即将过期租约" value={`${runtime.leases.expiring_soon}`} tone={runtime.leases.expiring_soon ? "danger" : "success"} />
-          <StatusLine label="活跃 Worker" value={`${runtime.workers.active}`} tone={runtime.workers.active ? "success" : "neutral"} />
-          <StatusLine label="最近完成" value={dateTime(runtime.tasks.last_finished_at)} tone="neutral" />
-        </div>
+        <>
+          {!runtime.workers.active && activeTasks > 0 && (
+            <div className="runtime-warning">
+              <CircleAlert size={16} />
+              <div>
+                <strong>任务已入库，等待 Worker</strong>
+                <span>当前有 {activeTasks} 个未完成任务；启动 Worker 后才会继续执行。</span>
+              </div>
+            </div>
+          )}
+          <div className="runtime-grid">
+            <StatusLine label="待处理队列" value={`${runtime.queues.ready}`} tone={runtime.queues.ready ? "warning" : "success"} />
+            <StatusLine label="处理中队列" value={`${runtime.queues.processing}`} tone={runtime.queues.processing ? "warning" : "neutral"} />
+            <StatusLine label="活跃租约" value={`${runtime.leases.active}`} tone={runtime.leases.active ? "warning" : "success"} />
+            <StatusLine label="即将过期租约" value={`${runtime.leases.expiring_soon}`} tone={runtime.leases.expiring_soon ? "danger" : "success"} />
+            <StatusLine label="活跃 Worker" value={`${runtime.workers.active}`} tone={runtime.workers.active ? "success" : "danger"} />
+            <StatusLine label="最近完成" value={dateTime(runtime.tasks.last_finished_at)} tone="neutral" />
+          </div>
+        </>
       ) : (
         <EmptyState title="暂无运行态" detail="启动管理 Worker 后，这里会显示队列与租约。" />
       )}
@@ -473,7 +824,7 @@ function Metric({
       <span className="metric-icon">{icon}</span>
       <strong>{value}</strong>
       <span>{label}</span>
-      <ArrowRight size={16} />
+      <ArrowRight size={16} className="metric-arrow" />
     </button>
   );
 }
@@ -484,6 +835,29 @@ function StatusLine({ label, value, tone }: { label: string; value: string; tone
       <span className={`status-dot tone-${tone}`} />
       <span>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function sumBalance(items: Balance[], field: "points" | "total_hsk") {
+  return items.reduce((total, item) => total + (item[field] === null ? 0 : Number(item[field])), 0);
+}
+
+function latestBalanceTime(items: Balance[]) {
+  const latest = items
+    .map((item) => item.last_synced_at)
+    .filter((value): value is string => Boolean(value))
+    .sort()
+    .at(-1);
+  return latest ? dateTime(latest) : "未同步";
+}
+
+function BalanceStat({ label, value, detail }: { label: string; value: number | string; detail: string }) {
+  return (
+    <div className="balance-stat">
+      <span>{label}</span>
+      <strong>{typeof value === "number" ? amount(value) : value}</strong>
+      <small>{detail}</small>
     </div>
   );
 }
@@ -499,11 +873,11 @@ function AccountsPage({
   onComplete: (message: string) => void;
   onNotice: (message: string, tone?: "success" | "error") => void;
 }) {
-  const accounts = useResource(api.accounts, refresh);
-  const bindings = useResource(api.bindings, refresh);
+  const accounts = useResource("accounts", api.accounts, refresh);
+  const bindings = useResource("bindings", api.bindings, refresh);
   const [importOpen, setImportOpen] = useState(false);
   const [bindingAccount, setBindingAccount] = useState<Account | null>(null);
-  const [workflowOpen, setWorkflowOpen] = useState(false);
+  const [workflowMode, setWorkflowMode] = useState<"verify" | "bind" | null>(null);
   const [verifyingAccountId, setVerifyingAccountId] = useState<string | null>(null);
   const occupiedAccountIds = useMemo(
     () =>
@@ -536,9 +910,13 @@ function AccountsPage({
         description="导入的 X 账号仅以掩码身份和会话状态显示。"
         action={
           <div className="toolbar-actions">
-            <Button onClick={() => setWorkflowOpen(true)} disabled={!vault?.unlocked}>
+            <Button onClick={() => setWorkflowMode("verify")} disabled={!vault?.unlocked}>
+              <ShieldCheck size={16} />
+              批量校验
+            </Button>
+            <Button onClick={() => setWorkflowMode("bind")} disabled={!vault?.unlocked}>
               <Layers3 size={16} />
-              批量绑定并转发
+              批量绑定
             </Button>
             <Button tone="primary" onClick={() => setImportOpen(true)} disabled={!vault?.unlocked}>
               <Plus size={17} />
@@ -553,7 +931,7 @@ function AccountsPage({
         ) : accounts.error ? (
           <EmptyState title="账号列表暂不可用" detail={accounts.error} />
         ) : accounts.value?.items.length ? (
-          <div className="table-wrap">
+          <div className="table-wrap binding-table">
             <table>
               <thead>
                 <tr>
@@ -644,13 +1022,14 @@ function AccountsPage({
           onNotice={onNotice}
         />
       )}
-      {workflowOpen && (
+      {workflowMode && (
         <WorkflowDialog
+          mode={workflowMode}
           accounts={accounts.value?.items ?? []}
           refresh={refresh}
-          onClose={() => setWorkflowOpen(false)}
+          onClose={() => setWorkflowMode(null)}
           onComplete={(message) => {
-            setWorkflowOpen(false);
+            setWorkflowMode(null);
             onComplete(message);
           }}
           onNotice={onNotice}
@@ -671,7 +1050,7 @@ function WalletsPage({
   onComplete: (message: string) => void;
   onNotice: (message: string, tone?: "success" | "error") => void;
 }) {
-  const wallets = useResource(api.wallets, refresh);
+  const wallets = useResource("wallets", api.wallets, refresh);
   const [importOpen, setImportOpen] = useState(false);
   return (
     <div className="page-stack">
@@ -690,7 +1069,7 @@ function WalletsPage({
         ) : wallets.error ? (
           <EmptyState title="地址列表暂不可用" detail={wallets.error} />
         ) : wallets.value?.items.length ? (
-          <div className="table-wrap">
+          <div className="table-wrap binding-table">
             <table>
               <thead>
                 <tr>
@@ -746,7 +1125,7 @@ function BindingsPage({
   onComplete: (message: string) => void;
   onNotice: (message: string, tone?: "success" | "error") => void;
 }) {
-  const bindings = useResource(api.bindings, refresh);
+  const bindings = useResource("bindings", api.bindings, refresh);
   const [selected, setSelected] = useState<string[]>([]);
   const [operation, setOperation] = useState<{ kind: "repost" | "claim"; bindingIds: string[] } | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -754,10 +1133,16 @@ function BindingsPage({
     () => bindings.value?.items.filter((binding) => binding.state === "bound") ?? [],
     [bindings.value]
   );
+  const selectAllRef = useRef<HTMLInputElement | null>(null);
+  const allVisibleSelected = visibleBound.length > 0 && selected.length === visibleBound.length;
+  const someVisibleSelected = selected.length > 0 && !allVisibleSelected;
 
   useEffect(() => {
     setSelected((current) => current.filter((id) => visibleBound.some((binding) => binding.id === id)));
   }, [bindings.value, visibleBound]);
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = someVisibleSelected;
+  }, [someVisibleSelected]);
 
   const toggle = (id: string) => {
     setSelected((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
@@ -784,6 +1169,7 @@ function BindingsPage({
             <Button
               onClick={() => setOperation({ kind: "repost", bindingIds: selected })}
               disabled={!vault?.unlocked || selected.length === 0}
+              title={!vault?.unlocked ? "Vault 已锁定，请先解锁" : selected.length === 0 ? "先选择至少一个绑定" : "创建转发任务"}
             >
               <Send size={16} />
               批量转发 ({selected.length})
@@ -792,6 +1178,7 @@ function BindingsPage({
               tone="primary"
               onClick={() => setOperation({ kind: "claim", bindingIds: selected })}
               disabled={!vault?.unlocked || selected.length === 0}
+              title={!vault?.unlocked ? "Vault 已锁定，请先解锁" : selected.length === 0 ? "先选择至少一个绑定" : "创建领取任务"}
             >
               <Play size={16} />
               批量领取 ({selected.length})
@@ -799,6 +1186,7 @@ function BindingsPage({
             <Button
               onClick={() => void syncBalances(selected)}
               disabled={!vault?.unlocked || selected.length === 0 || syncing}
+              title={!vault?.unlocked ? "Vault 已锁定，请先解锁" : selected.length === 0 ? "先选择至少一个绑定" : "同步所选余额"}
             >
               {syncing ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
               同步余额 ({selected.length})
@@ -812,15 +1200,17 @@ function BindingsPage({
         ) : bindings.error ? (
           <EmptyState title="绑定列表暂不可用" detail={bindings.error} />
         ) : bindings.value?.items.length ? (
-          <div className="table-wrap">
-            <table>
+          <>
+            <div className="table-wrap">
+              <table>
               <thead>
                 <tr>
                   <th className="checkbox-column">
                     <input
+                      ref={selectAllRef}
                       aria-label="选择所有已绑定记录"
                       type="checkbox"
-                      checked={visibleBound.length > 0 && selected.length === visibleBound.length}
+                      checked={allVisibleSelected}
                       onChange={() =>
                         setSelected(selected.length === visibleBound.length ? [] : visibleBound.map((item) => item.id))
                       }
@@ -893,13 +1283,69 @@ function BindingsPage({
                   );
                 })}
               </tbody>
-            </table>
-          </div>
+              </table>
+            </div>
+            <div className="binding-mobile-list">
+              {bindings.value.items.map((binding) => {
+                const eligible = binding.state === "bound";
+                return (
+                  <article className="binding-mobile-card" key={binding.id}>
+                  <div className="binding-mobile-heading">
+                    <label className="binding-mobile-select">
+                      <input
+                        aria-label={`选择 ${binding.account_handle}`}
+                        type="checkbox"
+                        checked={selected.includes(binding.id)}
+                        disabled={!eligible}
+                        onChange={() => toggle(binding.id)}
+                      />
+                      <strong>@{binding.account_handle}</strong>
+                    </label>
+                    <StateChip value={binding.state} />
+                  </div>
+                  <div className="binding-mobile-meta">
+                    <span className="mono">{compact(binding.wallet_address, 12, 8)}</span>
+                    <span>绑定于 {dateTime(binding.bound_at)}</span>
+                  </div>
+                  <div className="binding-mobile-balances">
+                    <span><small>Points</small><strong>{amount(binding.balance?.points)}</strong></span>
+                    <span><small>HSK</small><strong>{amount(binding.balance?.total_hsk)}</strong></span>
+                    <span><small>同步</small><strong>{binding.balance?.sync_status === "success" ? "已同步" : "未同步"}</strong></span>
+                  </div>
+                  <div className="binding-mobile-actions">
+                    <Button
+                      disabled={!eligible || !vault?.unlocked || syncing}
+                      onClick={() => void syncBalances([binding.id])}
+                    >
+                      {syncing ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}
+                      同步
+                    </Button>
+                    <Button
+                      disabled={!eligible || !vault?.unlocked}
+                      onClick={() => setOperation({ kind: "repost", bindingIds: [binding.id] })}
+                    >
+                      <Send size={14} />
+                      转发
+                    </Button>
+                    <Button
+                      tone="primary"
+                      disabled={!eligible || !vault?.unlocked}
+                      onClick={() => setOperation({ kind: "claim", bindingIds: [binding.id] })}
+                    >
+                      <Play size={14} />
+                      领取
+                    </Button>
+                  </div>
+                  </article>
+                );
+              })}
+            </div>
+          </>
         ) : (
           <EmptyState title="暂无绑定" detail="从账号页面选择一个未绑定账号，随后选择地址创建绑定任务。" />
         )}
       </Panel>
-      {!vault?.unlocked && <LockedHint label="解锁 Vault 后才可创建转发或领取任务。" />}
+      {!vault?.unlocked && <LockedHint label="Vault 已锁定：解锁后才可创建同步、转发或领取任务。" />}
       {operation && (
         <OperationDialog
           kind={operation.kind}
@@ -925,19 +1371,53 @@ function TasksPage({
   onComplete: (message: string) => void;
   onNotice: (message: string, tone?: "success" | "error") => void;
 }) {
-  const tasks = useResource(api.tasks, refresh);
-  const batches = useResource(api.taskBatches, refresh);
+  const [pollTick, setPollTick] = useState(0);
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [search, setSearch] = useState("");
+  const [stateFilter, setStateFilter] = useState("all");
+  const [batchFilter, setBatchFilter] = useState("all");
+  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null);
+  const [busyCommand, setBusyCommand] = useState<string | null>(null);
+  const resourceKey = refresh + pollTick;
+  const tasks = useResource("tasks", api.tasks, resourceKey, { ttlMs: 7_500 });
+  const batches = useResource("task-batches", api.taskBatches, resourceKey, { ttlMs: 7_500 });
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
+
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const timer = window.setInterval(() => setPollTick((value) => value + 1), 8000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh]);
+
+  useEffect(() => {
+    if (!tasks.loading && tasks.value) {
+      setLastUpdatedAt(Date.now());
+    }
+  }, [tasks.loading, tasks.value]);
+
+  useEffect(() => {
+    if (selectedBatchId && !batches.value?.items.some((batch) => batch.id === selectedBatchId)) {
+      setSelectedBatchId(null);
+    }
+  }, [batches.value, selectedBatchId]);
+
   const command = async (task: Task, action: "pause" | "cancel" | "retry" | "poll") => {
+    if (busyCommand) return;
+    setBusyCommand(`${task.id}:${action}`);
     try {
       await api.taskCommand(task.id, action);
       onComplete(`任务已${action === "poll" ? "加入轮询" : action === "retry" ? "重试" : action === "pause" ? "暂停" : "取消"}`);
       setSelectedTask(null);
     } catch (error) {
       onNotice(toMessage(error), "error");
+    } finally {
+      setBusyCommand(null);
     }
   };
   const batchCommand = async (batch: TaskBatch, action: "pause" | "resume" | "cancel") => {
+    if (busyCommand) return;
+    setBusyCommand(`${batch.id}:${action}`);
     try {
       await api.batchCommand(batch.id, action);
       onComplete(
@@ -949,22 +1429,96 @@ function TasksPage({
       );
     } catch (error) {
       onNotice(toMessage(error), "error");
+    } finally {
+      setBusyCommand(null);
     }
   };
+  const visibleTasks = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    const selectedBatch = batches.value?.items.find((batch) => batch.id === batchFilter);
+    const batchTaskIds = selectedBatch ? new Set(selectedBatch.jobs.map((job) => job.id)) : null;
+    return (tasks.value?.items ?? []).filter((task) => {
+      const matchesState = stateFilter === "all" || task.state === stateFilter;
+      const matchesBatch = !batchTaskIds || batchTaskIds.has(task.id);
+      const haystack = [
+        task.kind,
+        task.state,
+        task.id,
+        task.result_summary,
+        task.failure_code,
+        task.external_operation_ref,
+        task.social_account_id,
+        task.binding_id
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return matchesState && matchesBatch && (!needle || haystack.includes(needle));
+    });
+  }, [batchFilter, batches.value, search, stateFilter, tasks.value]);
+  const selectedBatch = batches.value?.items.find((batch) => batch.id === selectedBatchId) ?? null;
+  const stateOptions = useMemo(
+    () => Array.from(new Set((tasks.value?.items ?? []).map((task) => task.state))).sort(),
+    [tasks.value]
+  );
 
   return (
     <div className="page-stack">
       <PageToolbar
         description="每个任务都保留独立事件链、租约与重试状态。"
-        action={<span className="subtle-label">{batches.value?.total ?? 0} 个批次</span>}
+        action={
+          <div className="task-toolbar-meta">
+            <span className="subtle-label">
+              {autoRefresh ? "自动刷新 · 8s" : "手动刷新"}
+              {lastUpdatedAt ? ` · ${dateTime(new Date(lastUpdatedAt).toISOString())}` : ""}
+            </span>
+            <IconButton
+              label={autoRefresh ? "暂停自动刷新" : "开启自动刷新"}
+              onClick={() => setAutoRefresh((value) => !value)}
+              tone={autoRefresh ? "primary" : "neutral"}
+            >
+              <RefreshCw size={17} className={autoRefresh ? "spin-soft" : ""} />
+            </IconButton>
+            <IconButton label="立即刷新任务" onClick={() => setPollTick((value) => value + 1)}>
+              <RefreshCw size={17} />
+            </IconButton>
+            <span className="subtle-label">{batches.value?.total ?? 0} 个批次</span>
+          </div>
+        }
       />
+      <Panel className="task-filters">
+        <div className="filter-field">
+          <Search size={16} />
+          <input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="搜索任务类型、结果、资源 ID"
+            aria-label="搜索任务"
+          />
+        </div>
+        <select value={stateFilter} onChange={(event) => setStateFilter(event.target.value)} aria-label="按状态筛选">
+          <option value="all">全部状态</option>
+          {stateOptions.map((state) => (
+            <option key={state} value={state}>{stateLabel(state)}</option>
+          ))}
+        </select>
+        <select value={batchFilter} onChange={(event) => setBatchFilter(event.target.value)} aria-label="按批次筛选">
+          <option value="all">全部批次</option>
+          {(batches.value?.items ?? []).map((batch) => (
+            <option key={batch.id} value={batch.id}>{batch.name}</option>
+          ))}
+        </select>
+        <span className="filter-count">
+          {tasks.loading ? "加载中…" : `显示 ${visibleTasks.length} / ${tasks.value?.total ?? 0}`}
+        </span>
+      </Panel>
       <div className="tasks-layout">
         <Panel className="task-table-panel">
           {tasks.loading ? (
             <LoadingRows />
           ) : tasks.error ? (
             <EmptyState title="任务列表暂不可用" detail={tasks.error} />
-          ) : tasks.value?.items.length ? (
+          ) : visibleTasks.length ? (
             <div className="table-wrap">
               <table>
                 <thead>
@@ -974,17 +1528,23 @@ function TasksPage({
                     <th>尝试</th>
                     <th>资源</th>
                     <th>计划时间</th>
+                    <th>目标</th>
                     <th className="actions-column">操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {tasks.value.items.map((task) => (
+                  {visibleTasks.map((task) => (
                     <tr key={task.id} className={selectedTask?.id === task.id ? "is-selected" : ""}>
-                      <td><strong>{task.kind}</strong></td>
+                      <td><strong>{kindLabel(task.kind)}</strong></td>
                       <td><StateChip value={task.state} /></td>
                       <td>{task.attempt}</td>
                       <td className="mono">{compact(task.binding_id || task.social_account_id, 7, 5)}</td>
                       <td>{dateTime(task.scheduled_at)}</td>
+                      <td>
+                        <span className={task.target_configured ? "sync-state sync-success" : "sync-state sync-error"}>
+                          {task.target_configured ? "已配置" : "缺失"}
+                        </span>
+                      </td>
                       <td className="row-actions">
                         <Button onClick={() => setSelectedTask(task)}>查看</Button>
                       </td>
@@ -997,17 +1557,36 @@ function TasksPage({
             <EmptyState title="暂无任务" detail="绑定、转发或领取操作会生成可恢复的任务记录。" />
           )}
         </Panel>
-        <TaskDetail task={selectedTask} onCommand={command} onClose={() => setSelectedTask(null)} />
+        <TaskDetail
+          task={selectedTask}
+          onCommand={command}
+          onClose={() => setSelectedTask(null)}
+          busyCommand={busyCommand}
+        />
       </div>
       {batches.value?.items.length ? (
         <Panel title="最近批次">
-          <div className="batch-list">
+            <div className="batch-list">
             {batches.value.items.slice(0, 5).map((batch) => (
-              <BatchRow key={batch.id} batch={batch} onCommand={batchCommand} />
+              <BatchRow
+                key={batch.id}
+                batch={batch}
+                selected={batch.id === selectedBatchId}
+                onSelect={() => setSelectedBatchId(batch.id)}
+                onCommand={batchCommand}
+                busyCommand={busyCommand}
+              />
             ))}
           </div>
         </Panel>
       ) : null}
+      {selectedBatch && (
+        <BatchDetail
+          batch={selectedBatch}
+          onTaskSelect={setSelectedTask}
+          onClose={() => setSelectedBatchId(null)}
+        />
+      )}
     </div>
   );
 }
@@ -1015,11 +1594,13 @@ function TasksPage({
 function TaskDetail({
   task,
   onCommand,
-  onClose
+  onClose,
+  busyCommand
 }: {
   task: Task | null;
   onCommand: (task: Task, action: "pause" | "cancel" | "retry" | "poll") => void;
   onClose: () => void;
+  busyCommand: string | null;
 }) {
   if (!task) {
     return (
@@ -1042,10 +1623,10 @@ function TaskDetail({
         </IconButton>
       }
     >
-      <div className="detail-summary">
+          <div className="detail-summary">
         <div>
           <span>类型</span>
-          <strong>{task.kind}</strong>
+          <strong>{kindLabel(task.kind)}</strong>
         </div>
         <div>
           <span>状态</span>
@@ -1055,21 +1636,27 @@ function TaskDetail({
           <span>外部引用</span>
           <strong className="mono">{compact(task.external_operation_ref)}</strong>
         </div>
+        <div>
+          <span>任务目标</span>
+          <strong className={task.target_configured ? "success-text" : "danger-text"}>
+            {task.target_configured ? "已配置（原文已隐藏）" : "缺失"}
+          </strong>
+        </div>
       </div>
       <div className="command-row">
-        <Button disabled={!canPoll} onClick={() => onCommand(task, "poll")}>
+        <Button disabled={!canPoll || Boolean(busyCommand)} onClick={() => onCommand(task, "poll")}>
           <RefreshCw size={15} />
           轮询
         </Button>
-        <Button disabled={!canRetry} onClick={() => onCommand(task, "retry")}>
+        <Button disabled={!canRetry || Boolean(busyCommand)} onClick={() => onCommand(task, "retry")}>
           <RotateCcw size={15} />
           重试
         </Button>
-        <Button disabled={!canPause} onClick={() => onCommand(task, "pause")}>
+        <Button disabled={!canPause || Boolean(busyCommand)} onClick={() => onCommand(task, "pause")}>
           <Clock3 size={15} />
           暂停
         </Button>
-        <Button tone="danger" disabled={!canCancel} onClick={() => onCommand(task, "cancel")}>
+        <Button tone="danger" disabled={!canCancel || Boolean(busyCommand)} onClick={() => onCommand(task, "cancel")}>
           <X size={15} />
           取消
         </Button>
@@ -1081,7 +1668,11 @@ function TaskDetail({
               <span className={`timeline-dot tone-${stateTone(event.to_state || "neutral")}`} />
               <div>
                 <strong>{event.summary || event.event_type}</strong>
-                <small>{event.from_state ? `${event.from_state} → ${event.to_state}` : event.to_state || event.event_type}</small>
+                <small>
+                  {event.from_state
+                    ? `${stateLabel(event.from_state)} → ${stateLabel(event.to_state || "")}`
+                    : stateLabel(event.to_state || event.event_type)}
+                </small>
               </div>
               <time>{dateTime(event.created_at)}</time>
             </div>
@@ -1096,10 +1687,16 @@ function TaskDetail({
 
 function BatchRow({
   batch,
-  onCommand
+  selected,
+  onSelect,
+  onCommand,
+  busyCommand
 }: {
   batch: TaskBatch;
+  selected: boolean;
+  onSelect: () => void;
   onCommand: (batch: TaskBatch, action: "pause" | "resume" | "cancel") => void;
+  busyCommand: string | null;
 }) {
   const states = batch.jobs.reduce<Record<string, number>>((counts, task) => {
     counts[task.state] = (counts[task.state] ?? 0) + 1;
@@ -1111,14 +1708,14 @@ function BatchRow({
   const failed = states.failed ?? 0;
   const completion = batch.jobs.length ? Math.round((completed / batch.jobs.length) * 100) : 0;
   return (
-    <div className="batch-row">
+    <div className={`batch-row ${selected ? "is-selected" : ""}`}>
       <div className="batch-icon"><Layers3 size={17} /></div>
       <div>
         <strong>{batch.name}</strong>
-        <span>{batch.workflow_type === "account_wallet" ? "账号-地址工作流" : batch.kind} · dispatch {batch.dispatch_limit}</span>
+        <span>{workflowLabel(batch.workflow_type)} · 调度 {batch.dispatch_limit}</span>
         <div className="batch-progress" aria-label={`${batch.name} 完成 ${completion}%`}>
           <span><i style={{ width: `${completion}%` }} /></span>
-          <small>{completed}/{batch.jobs.length} · {completion}%{failed ? ` · ${failed} failed` : ""}</small>
+          <small>{completed}/{batch.jobs.length} · {completion}%{failed ? ` · ${failed} 失败` : ""}</small>
         </div>
       </div>
       <div className="batch-states">
@@ -1128,24 +1725,79 @@ function BatchRow({
         ))}
       </div>
       <div className="batch-actions">
+        <IconButton label="查看批次详情" onClick={onSelect} tone={selected ? "primary" : "neutral"}>
+          <ChevronRight size={15} />
+        </IconButton>
         {batch.state === "active" && (
-          <IconButton label="暂停批次" onClick={() => onCommand(batch, "pause")}>
+          <IconButton label="暂停批次" disabled={Boolean(busyCommand)} onClick={() => onCommand(batch, "pause")}>
             <Clock3 size={15} />
           </IconButton>
         )}
         {batch.state === "paused" && (
-          <IconButton label="恢复批次" tone="primary" onClick={() => onCommand(batch, "resume")}>
+          <IconButton label="恢复批次" tone="primary" disabled={Boolean(busyCommand)} onClick={() => onCommand(batch, "resume")}>
             <Play size={15} />
           </IconButton>
         )}
         {["active", "paused"].includes(batch.state) && (
-          <IconButton label="取消批次" tone="danger" onClick={() => onCommand(batch, "cancel")}>
+          <IconButton label="取消批次" tone="danger" disabled={Boolean(busyCommand)} onClick={() => onCommand(batch, "cancel")}>
             <X size={15} />
           </IconButton>
         )}
       </div>
       <time>{dateTime(batch.created_at)}</time>
     </div>
+  );
+}
+
+function BatchDetail({
+  batch,
+  onTaskSelect,
+  onClose
+}: {
+  batch: TaskBatch;
+  onTaskSelect: (task: Task) => void;
+  onClose: () => void;
+}) {
+  const counts = batch.jobs.reduce<Record<string, number>>((result, task) => {
+    result[task.state] = (result[task.state] ?? 0) + 1;
+    return result;
+  }, {});
+  const finished = batch.jobs.filter((task) =>
+    ["succeeded", "failed", "cancelled"].includes(task.state)
+  ).length;
+  const completion = batch.jobs.length ? Math.round((finished / batch.jobs.length) * 100) : 0;
+  const configuredTargets = batch.jobs.filter((task) => task.target_configured).length;
+  return (
+    <Panel
+      title={`批次详情 · ${batch.name}`}
+      className="batch-detail-panel"
+      action={<IconButton label="关闭批次详情" onClick={onClose}><X size={17} /></IconButton>}
+    >
+      <div className="batch-detail-summary">
+        <div><span>阶段</span><strong>{workflowLabel(batch.workflow_type)}</strong></div>
+        <div><span>调度窗口</span><strong>{batch.dispatch_limit}</strong></div>
+        <div><span>完成度</span><strong>{finished}/{batch.jobs.length} · {completion}%</strong></div>
+        <div><span>目标配置</span><strong>{configuredTargets}/{batch.jobs.length} 已配置</strong></div>
+        <div>
+          <span>状态分布</span>
+          <strong>
+            {Object.entries(counts).map(([state, count]) => `${stateLabel(state)} ${count}`).join(" · ") || "—"}
+          </strong>
+        </div>
+      </div>
+      <div className="batch-job-list">
+        {batch.jobs.map((task) => (
+          <button key={task.id} type="button" className="batch-job-row" onClick={() => onTaskSelect(task)}>
+            <span className={`timeline-dot tone-${stateTone(task.state)}`} />
+            <strong>{kindLabel(task.kind)}</strong>
+            <StateChip value={task.state} />
+            <span className="mono">{compact(task.binding_id || task.social_account_id, 9, 6)}</span>
+            <small>{task.result_summary || task.failure_code || "等待执行"}</small>
+            <ChevronRight size={15} />
+          </button>
+        ))}
+      </div>
+    </Panel>
   );
 }
 
@@ -1164,7 +1816,7 @@ function VaultPage({
   const [backupMode, setBackupMode] = useState<"create" | "verify" | "restore" | null>(null);
   const [recoveryKey, setRecoveryKey] = useState<string | null>(null);
   const [backupResult, setBackupResult] = useState<(VaultBackupSummary & { restored?: boolean }) | null>(null);
-  const vault = useResource(api.vaultStatus, refresh);
+  const vault = useResource("vault-status", api.vaultStatus, refresh);
   const active = status || vault.value;
 
   const lock = async () => {
@@ -1410,7 +2062,10 @@ function BackupDialog({
 function PageToolbar({ description, action }: { description: string; action?: ReactNode }) {
   return (
     <div className="page-toolbar">
-      <p>{description}</p>
+      <div className="page-toolbar-copy">
+        <span>WORKSPACE</span>
+        <p>{description}</p>
+      </div>
       {action}
     </div>
   );
@@ -1662,7 +2317,7 @@ function BindDialog({
   onComplete: (message: string) => void;
   onNotice: (message: string, tone?: "success" | "error") => void;
 }) {
-  const wallets = useResource(api.wallets, refresh);
+  const wallets = useResource("wallets", api.wallets, refresh);
   const [walletId, setWalletId] = useState("");
   const [target, setTarget] = useState("kredo:bind");
   const [busy, setBusy] = useState(false);
@@ -1720,22 +2375,27 @@ function BindDialog({
 type WorkflowPair = { accountId: string; walletId: string };
 
 function WorkflowDialog({
+  mode,
   accounts,
   refresh,
   onClose,
   onComplete,
   onNotice
 }: {
+  mode: "verify" | "bind";
   accounts: Account[];
   refresh: number;
   onClose: () => void;
   onComplete: (message: string) => void;
   onNotice: (message: string, tone?: "success" | "error") => void;
 }) {
-  const wallets = useResource(api.wallets, refresh);
-  const bindings = useResource(api.bindings, refresh);
-  const [name, setName] = useState(`绑定并转发 ${new Date().toLocaleDateString("zh-CN")}`);
-  const [repostTarget, setRepostTarget] = useState("");
+  const wallets = useResource("wallets", api.wallets, refresh);
+  const bindings = useResource("bindings", api.bindings, refresh);
+  const [name, setName] = useState(
+    mode === "verify"
+      ? `会话校验 ${new Date().toLocaleDateString("zh-CN")}`
+      : `绑定 ${new Date().toLocaleDateString("zh-CN")}`
+  );
   const [dispatchLimit, setDispatchLimit] = useState(10);
   const [pairs, setPairs] = useState<WorkflowPair[]>([{ accountId: "", walletId: "" }]);
   const [busy, setBusy] = useState(false);
@@ -1758,14 +2418,33 @@ function WorkflowDialog({
       ),
     [bindings.value]
   );
-  const availableAccounts = accounts.filter(
-    (account) => account.state === "active" && !occupiedAccounts.has(account.id)
-  );
+  const availableAccounts = accounts.filter((account) => account.state === "active" && !occupiedAccounts.has(account.id));
   const availableWallets = (wallets.value?.items ?? []).filter(
     (wallet) => wallet.state === "active" && !occupiedWallets.has(wallet.id)
   );
+  const selectableAccounts = mode === "verify" ? accounts.filter((account) => account.state === "active") : availableAccounts;
+
+  useEffect(() => {
+    setName(
+      mode === "verify"
+        ? `会话校验 ${new Date().toLocaleDateString("zh-CN")}`
+        : `绑定 ${new Date().toLocaleDateString("zh-CN")}`
+    );
+    setPairs([{ accountId: "", walletId: "" }]);
+    setBusy(false);
+  }, [mode]);
 
   const autoPair = () => {
+    if (mode === "verify") {
+      const pairCount = Math.min(10, selectableAccounts.length);
+      setPairs(
+        Array.from({ length: pairCount }, (_, index) => ({
+          accountId: selectableAccounts[index].id,
+          walletId: ""
+        }))
+      );
+      return;
+    }
     const pairCount = Math.min(10, availableAccounts.length, availableWallets.length);
     setPairs(
       Array.from({ length: pairCount }, (_, index) => ({
@@ -1785,25 +2464,29 @@ function WorkflowDialog({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (
-      pairs.some((pair) => !pair.accountId || !pair.walletId) ||
-      !repostTarget.trim() ||
-      !name.trim()
-    ) {
+    if (pairs.some((pair) => !pair.accountId || (mode === "bind" && !pair.walletId)) || !name.trim()) {
       return;
     }
     setBusy(true);
     try {
-      await api.createWorkflowBatch({
+      await api.createStageBatch({
         name,
+        stage: mode,
         dispatch_limit: dispatchLimit,
-        items: pairs.map((pair) => ({
-          social_account_id: pair.accountId,
-          wallet_id: pair.walletId,
-          repost_target: repostTarget
-        }))
+        items: pairs.map((pair) =>
+          mode === "verify"
+            ? {
+                social_account_id: pair.accountId,
+                external_target: "x:verify"
+              }
+            : {
+                social_account_id: pair.accountId,
+                wallet_id: pair.walletId,
+                external_target: "kredo:bind"
+              }
+        )
       });
-      onComplete(`已创建 ${pairs.length} 组批量执行任务`);
+      onComplete(`已创建 ${pairs.length} 组${mode === "verify" ? "校验" : "绑定"}任务`);
     } catch (error) {
       onNotice(toMessage(error), "error");
     } finally {
@@ -1812,21 +2495,12 @@ function WorkflowDialog({
   };
 
   return (
-    <Dialog title="创建批量绑定并转发" onClose={onClose} wide>
+    <Dialog title={mode === "verify" ? "创建批量校验" : "创建批量绑定"} onClose={onClose} wide>
       <form className="dialog-form" onSubmit={submit}>
         <div className="workflow-header">
           <label>
             <span>批次名称</span>
             <input value={name} onChange={(event) => setName(event.target.value)} required />
-          </label>
-          <label>
-            <span>转发目标</span>
-            <input
-              value={repostTarget}
-              onChange={(event) => setRepostTarget(event.target.value)}
-              placeholder="X 推文链接或 ID"
-              required
-            />
           </label>
           <label>
             <span>并发窗口</span>
@@ -1842,30 +2516,35 @@ function WorkflowDialog({
         </div>
         <div className="workflow-pairs">
           <div className="workflow-pairs-heading">
-            <strong>账号与地址配对</strong>
+            <strong>{mode === "verify" ? "账号选择" : "账号与地址配对"}</strong>
             <div className="toolbar-actions">
-              <Button onClick={autoPair} disabled={!availableAccounts.length || !availableWallets.length}>
-                <RefreshCw size={15} />
-                自动配对前 10 组
-              </Button>
               <Button
-                onClick={() => setPairs((current) => [...current, { accountId: "", walletId: "" }])}
-                disabled={pairs.length >= Math.min(availableAccounts.length, availableWallets.length)}
+                onClick={autoPair}
+                disabled={!selectableAccounts.length || (mode === "bind" && !availableWallets.length)}
               >
-                <Plus size={15} />
-                添加配对
+                <RefreshCw size={15} />
+                {mode === "verify" ? "自动填充前 10 个账号" : "自动配对前 10 组"}
               </Button>
+              {mode === "bind" && (
+                <Button
+                  onClick={() => setPairs((current) => [...current, { accountId: "", walletId: "" }])}
+                  disabled={pairs.length >= Math.min(availableAccounts.length, availableWallets.length)}
+                >
+                  <Plus size={15} />
+                  添加配对
+                </Button>
+              )}
             </div>
           </div>
           {pairs.map((pair, index) => {
-            const otherAccountIds = new Set(
-              pairs.filter((_, pairIndex) => pairIndex !== index).map((item) => item.accountId)
-            );
+            const otherAccountIds = mode === "bind"
+              ? new Set(pairs.filter((_, pairIndex) => pairIndex !== index).map((item) => item.accountId))
+              : new Set<string>();
             const otherWalletIds = new Set(
               pairs.filter((_, pairIndex) => pairIndex !== index).map((item) => item.walletId)
             );
             return (
-              <div className="workflow-pair-row" key={index}>
+              <div className={`workflow-pair-row ${mode === "verify" ? "workflow-pair-row-single" : ""}`} key={index}>
                 <span className="pair-index">{String(index + 1).padStart(2, "0")}</span>
                 <select
                   value={pair.accountId}
@@ -1873,43 +2552,62 @@ function WorkflowDialog({
                   required
                 >
                   <option value="">选择账号</option>
-                  {availableAccounts
-                    .filter((account) => account.id === pair.accountId || !otherAccountIds.has(account.id))
+                  {selectableAccounts
+                    .filter((account) => mode === "verify" || account.id === pair.accountId || !otherAccountIds.has(account.id))
                     .map((account) => (
                       <option key={account.id} value={account.id}>@{account.handle}</option>
                     ))}
                 </select>
-                <ArrowRight size={16} />
-                <select
-                  value={pair.walletId}
-                  onChange={(event) => updatePair(index, "walletId", event.target.value)}
-                  required
-                >
-                  <option value="">选择地址</option>
-                  {availableWallets
-                    .filter((wallet) => wallet.id === pair.walletId || !otherWalletIds.has(wallet.id))
-                    .map((wallet) => (
-                      <option key={wallet.id} value={wallet.id}>{compact(wallet.address, 12, 8)}</option>
-                    ))}
-                </select>
-                <IconButton
-                  label="移除配对"
-                  onClick={() => setPairs((current) => current.filter((_, pairIndex) => pairIndex !== index))}
-                  disabled={pairs.length === 1}
-                  tone="danger"
-                >
-                  <X size={16} />
-                </IconButton>
+                {mode === "bind" ? (
+                  <>
+                    <ArrowRight size={16} />
+                    <select
+                      value={pair.walletId}
+                      onChange={(event) => updatePair(index, "walletId", event.target.value)}
+                      required
+                    >
+                      <option value="">选择地址</option>
+                      {availableWallets
+                        .filter((wallet) => wallet.id === pair.walletId || !otherWalletIds.has(wallet.id))
+                        .map((wallet) => (
+                          <option key={wallet.id} value={wallet.id}>{compact(wallet.address, 12, 8)}</option>
+                        ))}
+                    </select>
+                    <IconButton
+                      label="移除配对"
+                      onClick={() => setPairs((current) => current.filter((_, pairIndex) => pairIndex !== index))}
+                      disabled={pairs.length === 1}
+                      tone="danger"
+                    >
+                      <X size={16} />
+                    </IconButton>
+                  </>
+                ) : (
+                  <IconButton
+                    label="移除账号"
+                    onClick={() => setPairs((current) => current.filter((_, pairIndex) => pairIndex !== index))}
+                    disabled={pairs.length === 1}
+                    tone="danger"
+                  >
+                    <X size={16} />
+                  </IconButton>
+                )}
               </div>
             );
           })}
         </div>
         <p className="form-hint">
-          每组会按“登录校验 → 绑定地址 → 转发 → 领取”顺序执行；单组失败不会占用其他配对。
+          {mode === "verify"
+            ? "每组只做会话校验，单个账号失败不会影响其他账号。"
+            : "每组只做地址绑定，单组失败不会影响其他配对。"}
         </p>
         <div className="dialog-actions">
           <Button onClick={onClose}>取消</Button>
-          <Button tone="primary" type="submit" disabled={busy || !availableAccounts.length || !availableWallets.length}>
+          <Button
+            tone="primary"
+            type="submit"
+            disabled={busy || !availableAccounts.length || (mode === "bind" && !availableWallets.length)}
+          >
             {busy ? <LoaderCircle className="spin" size={16} /> : <Layers3 size={16} />}
             创建 {pairs.length} 组
           </Button>
